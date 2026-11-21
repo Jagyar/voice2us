@@ -64,9 +64,13 @@ type appState struct {
 	muted      bool
 	hangupBtn  *widget.Button
 
-	root       *fyne.Container // стек: главный экран + экран разговора
 	mainScreen *fyne.Container
 	callScreen *fyne.Container
+	mainBottom *fyne.Container // нижняя часть главного экрана (коды, статус)
+	callBottom *fyne.Container // нижняя часть экрана разговора (завершить)
+	devicesBox *fyne.Container // устройства и громкость: видны на обоих экранах
+	inCall     bool            // UI-поток: идёт разговор, устройства открыты
+	quit       chan struct{}
 }
 
 func newAppState(a fyne.App, w fyne.Window) *appState {
@@ -134,6 +138,8 @@ func (s *appState) buildUI() {
 		widget.NewLabel("Ваше имя:"),
 		s.nameEntry,
 		widget.NewSeparator(),
+	)
+	s.mainBottom = container.NewVBox(
 		container.NewGridWithColumns(2, s.createBtn, copyBtn),
 		s.myCodeEntry,
 		widget.NewSeparator(),
@@ -155,9 +161,12 @@ func (s *appState) buildUI() {
 			return
 		}
 		s.prefs.SetString("micDev", name)
+		if !s.inCall {
+			return // до разговора только запоминаем выбор: микрофон не открываем
+		}
 		go func() {
 			if err := s.engine.UseCaptureByName(name); err != nil {
-				fyne.Do(func() { s.callStatus.SetText("Микрофон: " + err.Error()) })
+				fyne.Do(func() { s.deviceErr("Микрофон: " + err.Error()) })
 			}
 		}()
 	})
@@ -166,9 +175,12 @@ func (s *appState) buildUI() {
 			return
 		}
 		s.prefs.SetString("spkDev", name)
+		if !s.inCall {
+			return
+		}
 		go func() {
 			if err := s.engine.UsePlaybackByName(name); err != nil {
-				fyne.Do(func() { s.callStatus.SetText("Динамик: " + err.Error()) })
+				fyne.Do(func() { s.deviceErr("Динамик: " + err.Error()) })
 			}
 		}()
 	})
@@ -205,6 +217,9 @@ func (s *appState) buildUI() {
 		s.rttLabel,
 		s.muteBtn,
 		widget.NewSeparator(),
+	)
+	s.callBottom = container.NewVBox(s.hangupBtn)
+	s.devicesBox = container.NewVBox(
 		widget.NewLabel("Микрофон:"),
 		s.micSelect,
 		container.NewBorder(nil, nil, nil, s.micPct, s.micSlider),
@@ -213,12 +228,18 @@ func (s *appState) buildUI() {
 		container.NewBorder(nil, nil, nil, s.spkPct, s.spkSlider),
 		s.refreshBtn,
 		widget.NewSeparator(),
-		s.hangupBtn,
 	)
 
-	s.root = container.NewStack(s.mainScreen, s.callScreen)
 	s.callScreen.Hide()
-	s.win.SetContent(container.NewScroll(s.root))
+	s.callBottom.Hide()
+	s.win.SetContent(container.NewScroll(container.NewVBox(
+		container.NewStack(s.mainScreen, s.callScreen),
+		s.devicesBox,
+		container.NewStack(s.mainBottom, s.callBottom),
+	)))
+
+	s.quit = make(chan struct{})
+	go s.watchDevices(s.quit)
 
 	s.win.SetCloseIntercept(func() {
 		s.shutdown()
@@ -242,6 +263,7 @@ func (s *appState) loadPrefs() {
 		s.engine.SetMicVolume(micVol / 100)
 		s.engine.SetSpkVolume(spkVol / 100)
 	}
+	s.refreshDevices() // устройства выбираются ещё до подключения
 }
 
 // --- главный экран ---
@@ -461,7 +483,6 @@ func (s *appState) startSession(peer *proto.Code, waitFriend bool) {
 	go sess.Run(ctx)
 	go s.pump(sess, ctx)
 	go s.micPuller(sess, ctx.Done())
-	go s.watchDevices(ctx.Done())
 }
 
 // pump перекладывает события сессии в интерфейс, а входящие кадры — в звук.
@@ -580,9 +601,33 @@ func (s *appState) watchDevices(done <-chan struct{}) {
 func (s *appState) showCall(peerName string) {
 	s.peerLabel.SetText("Разговор с " + peerName)
 	s.callStatus.SetText("Подключено")
-	s.mainScreen.Hide()
-	s.callScreen.Show()
-	s.refreshDevices()
+	s.inCall = true
+	s.setScreen(true)
+	s.refreshDevices() // открывает выбранные устройства, раз разговор идёт
+}
+
+// setScreen переключает верх и низ между главным экраном и экраном разговора.
+func (s *appState) setScreen(call bool) {
+	if call {
+		s.mainScreen.Hide()
+		s.mainBottom.Hide()
+		s.callScreen.Show()
+		s.callBottom.Show()
+	} else {
+		s.callScreen.Hide()
+		s.callBottom.Hide()
+		s.mainScreen.Show()
+		s.mainBottom.Show()
+	}
+}
+
+// deviceErr показывает ошибку устройства на текущем экране.
+func (s *appState) deviceErr(msg string) {
+	if s.inCall {
+		s.callStatus.SetText(msg)
+	} else {
+		s.setStatus(msg)
+	}
 }
 
 func (s *appState) refreshDevices() {
@@ -605,18 +650,21 @@ func (s *appState) refreshDevices() {
 	}
 
 	if err1 != nil || err2 != nil {
-		s.callStatus.SetText("Не удалось перечислить устройства.")
+		s.deviceErr("Не удалось перечислить устройства.")
 		return
+	}
+	if !s.inCall {
+		return // до разговора устройства не открываем (индикатор микрофона не горит)
 	}
 
 	micDev := s.micSelect.Selected
 	spkDev := s.spkSelect.Selected
 	go func() {
 		if err := s.engine.UseCaptureByName(micDev); err != nil {
-			fyne.Do(func() { s.callStatus.SetText("Микрофон: " + err.Error()) })
+			fyne.Do(func() { s.deviceErr("Микрофон: " + err.Error()) })
 		}
 		if err := s.engine.UsePlaybackByName(spkDev); err != nil {
-			fyne.Do(func() { s.callStatus.SetText("Динамик: " + err.Error()) })
+			fyne.Do(func() { s.deviceErr("Динамик: " + err.Error()) })
 		}
 	}()
 }
@@ -672,6 +720,7 @@ func (s *appState) finishCall(reason string) {
 	if s.engine != nil {
 		s.engine.StopDevices()
 	}
+	s.inCall = false
 	s.session = nil
 	s.peerCode = nil
 	s.setMuted(false)
@@ -683,12 +732,15 @@ func (s *appState) finishCall(reason string) {
 }
 
 func (s *appState) showMain(status string) {
-	s.callScreen.Hide()
-	s.mainScreen.Show()
+	s.setScreen(false)
 	s.setStatus(status)
 }
 
 func (s *appState) shutdown() {
+	if s.quit != nil {
+		close(s.quit)
+		s.quit = nil
+	}
 	// Сначала Stop (шлёт bye), потом cancel: иначе отмена контекста
 	// успевает занять stopOnce, и друг не получит прощальный пакет.
 	if s.session != nil {

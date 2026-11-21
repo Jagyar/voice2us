@@ -49,6 +49,12 @@ type Device struct {
 type Engine struct {
 	ctx *malgo.AllocatedContext
 
+	// ctxMu: Devices (читатели) не должен пересекаться с Close (писатель),
+	// иначе перечисление на уже уничтоженном контексте. Только для списков:
+	// на устройства и колбэки он не влияет.
+	ctxMu  sync.RWMutex
+	closed bool
+
 	// Состояние устройств — только под e.mu; колбэки e.mu не берут.
 	mu       sync.Mutex
 	capDev   *malgo.Device
@@ -89,7 +95,12 @@ func NewEngine() (*Engine, error) {
 // Close stops devices and releases the audio context.
 func (e *Engine) Close() {
 	e.StopDevices()
-	_ = e.ctx.Uninit()
+	e.ctxMu.Lock()
+	defer e.ctxMu.Unlock()
+	if !e.closed {
+		e.closed = true
+		_ = e.ctx.Uninit()
+	}
 }
 
 // Devices lists capture or playback endpoints and caches them: device ids
@@ -99,7 +110,13 @@ func (e *Engine) Devices(kind DeviceKind) ([]Device, error) {
 	if kind == KindCapture {
 		t = malgo.Capture
 	}
+	e.ctxMu.RLock()
+	if e.closed {
+		e.ctxMu.RUnlock()
+		return nil, errNoDevices
+	}
 	infos, err := e.ctx.Devices(t)
+	e.ctxMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
