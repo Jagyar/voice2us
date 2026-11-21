@@ -45,6 +45,12 @@ func sanitizeEndpoints(in []string) []string {
 	return out
 }
 
+// Sanitized возвращает копию с очищенными и ограниченными списками адресов
+// (для данных, пришедших извне, не через UnmarshalCode).
+func (e Endpoints) Sanitized() Endpoints {
+	return Endpoints{Public: sanitizeEndpoints(e.Public), LAN: sanitizeEndpoints(e.LAN)}
+}
+
 // SameCode reports whether two codes describe the same peer half
 // (used to detect that the user pasted their own code).
 func SameCode(a, b *Code) bool {

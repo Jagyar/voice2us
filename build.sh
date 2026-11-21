@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Собирает Voice2Us для macOS (.app + .dmg) и Windows (.exe).
 # Использование: ./build.sh [mac|win|all]   (по умолчанию all)
-# Версия: VERSION=1.2.3 ./build.sh  (по умолчанию 1.0.0)
+# Версия: VERSION=2.1.0 ./build.sh  (по умолчанию 2.0.0); показывается в приложении
 # Требуется: go, Xcode CLT, mingw-w64 (brew install mingw-w64).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 TARGET="${1:-all}"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-2.0.0}"
 mkdir -p dist
 
 build_mac() {
@@ -15,7 +15,7 @@ echo "==> сборка macOS (universal: arm64 + amd64)..."
 for arch in arm64 amd64; do
 	GOOS=darwin GOARCH=$arch CGO_ENABLED=1 \
 		CC="clang -arch $([ $arch = arm64 ] && echo arm64 || echo x86_64)" \
-		go build -trimpath -ldflags "-s -w" -o dist/voice2us-macos-$arch .
+		go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o dist/voice2us-macos-$arch .
 done
 lipo -create -output dist/voice2us-macos dist/voice2us-macos-arm64 dist/voice2us-macos-amd64
 rm -f dist/voice2us-macos-arm64 dist/voice2us-macos-amd64
@@ -68,10 +68,10 @@ build_win() {
 
 echo "==> сборка Windows (x64)..."
 if [ "$(go env GOOS)" = windows ]; then
-	CGO_ENABLED=1 go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
+	CGO_ENABLED=1 go build -trimpath -ldflags "-H windowsgui -s -w -X main.version=$VERSION" -o dist/Voice2Us.exe .
 else
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
-		go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
+		go build -trimpath -ldflags "-H windowsgui -s -w -X main.version=$VERSION" -o dist/Voice2Us.exe .
 fi
 echo "    готово: dist/Voice2Us.exe"
 }

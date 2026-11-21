@@ -1,0 +1,29 @@
+[Unit]
+Description=Voice2Us rendezvous (знакомство, статус и вызовы друзей)
+After=network.target
+
+[Service]
+User=voice2us
+Group=voice2us
+ExecStart=/opt/voice2us/rendezvous -addr :8787
+Restart=always
+RestartSec=2
+
+# Изоляция: сервис ничего не пишет на диск и ничего не видит, кроме сети.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryMax=128M
+TasksMax=256
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

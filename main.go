@@ -1,5 +1,6 @@
-// Voice2Us — P2P голосовой чат на двоих: UDP напрямую между машинами,
-// ChaCha20-Poly1305 поверх, звук — несжатый PCM. Без серверов.
+// Voice2Us — голосовой чат с друзьями: звук идёт напрямую между машинами
+// по UDP (ChaCha20-Poly1305, несжатый PCM). Крошечный сервер-«встречалка»
+// нужен только чтобы друзья нашли друг друга и видели, кто онлайн.
 package main
 
 import (
@@ -19,8 +20,10 @@ func main() {
 	}
 
 	a := app.NewWithID("ru.jagyar.voice2us")
+	a.Settings().SetTheme(newAppTheme())
 	w := a.NewWindow("Voice2Us")
-	w.Resize(fyne.NewSize(480, 720))
+	w.Resize(fyne.NewSize(420, 760))
+	w.CenterOnScreen()
 
 	s := newAppState(a, w)
 	s.buildUI()

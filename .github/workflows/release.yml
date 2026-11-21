@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./internal/proto ./internal/stun
+      - run: go test ./internal/proto ./internal/stun ./internal/rdv
       - name: Build .dmg
         run: VERSION="${GITHUB_REF_NAME#v}" ./build.sh mac
       - run: mv dist/Voice2Us.dmg "dist/Voice2Us-${GITHUB_REF_NAME}-macOS.dmg"
@@ -37,7 +37,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Build .exe
-        run: ./build.sh win
+        run: VERSION="${GITHUB_REF_NAME#v}" ./build.sh win
       - run: mv dist/Voice2Us.exe "dist/Voice2Us-${GITHUB_REF_NAME}-Windows.exe"
       - uses: actions/upload-artifact@v4
         with:
@@ -57,4 +57,6 @@ jobs:
         with:
           name: Voice2Us ${{ github.ref_name }}
           generate_release_notes: true
+          # теги вида v2.0.0-rc.1 публикуются как предварительные релизы
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*
