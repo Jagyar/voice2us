@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Собирает Voice2Us.app для macOS и Voice2Us.exe для Windows.
+# Собирает Voice2Us.app + Voice2Us.dmg для macOS и Voice2Us.exe для Windows.
 # Требуется: go, Xcode CLT, mingw-w64 (brew install mingw-w64).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -50,12 +50,20 @@ EOF
 codesign --force -s - "$APP" 2>/dev/null || true
 echo "    готово: $APP"
 
+echo "==> упаковка DMG..."
+rm -f dist/Voice2Us.dmg
+hdiutil create -volname Voice2Us -srcfolder "$APP" -ov -format UDZO dist/Voice2Us.dmg >/dev/null
+echo "    готово: dist/Voice2Us.dmg"
+
 echo "==> сборка Windows (x64)..."
 GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
 	go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
 echo "    готово: dist/Voice2Us.exe"
 
 ( cd dist && zip -qr Voice2Us-mac.zip Voice2Us.app && zip -qr Voice2Us-windows.zip Voice2Us.exe )
+
+echo "==> контрольные тесты..."
+go test -race -count=1 -timeout 120s ./... >/dev/null && echo "    тесты: OK"
 
 echo "==> итог в dist/:"
 ls -lh dist/ | awk '{print "    " $9, $5}'
