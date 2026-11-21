@@ -1,0 +1,50 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Voice2Us: два голоса — два пузыря, звуковая волна и эквалайзер -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1B2B55"/>
+      <stop offset="100%" stop-color="#0C1230"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5CC9F8"/>
+      <stop offset="100%" stop-color="#1E88E5"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#B388FF"/>
+      <stop offset="100%" stop-color="#7C4DFF"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect width="1024" height="1024" rx="224"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+    <circle cx="270" cy="210" r="430" fill="#FFFFFF" opacity="0.05"/>
+    <circle cx="850" cy="880" r="380" fill="#000000" opacity="0.10"/>
+  </g>
+
+  <!-- голос 1: пузырь с эквалайзером -->
+  <g>
+    <rect x="140" y="240" width="430" height="340" rx="100" fill="url(#cyan)"/>
+    <path d="M250 570 L250 700 L390 570 Z" fill="url(#cyan)"/>
+    <g fill="#FFFFFF" opacity="0.96">
+      <rect x="255" y="350" width="44" height="110" rx="22"/>
+      <rect x="325" y="310" width="44" height="190" rx="22"/>
+      <rect x="395" y="330" width="44" height="150" rx="22"/>
+      <rect x="465" y="370" width="44" height="70" rx="22"/>
+    </g>
+  </g>
+
+  <!-- голос 2: пузырь со звуковой волной -->
+  <g>
+    <rect x="440" y="420" width="440" height="340" rx="100" fill="url(#violet)" stroke="#0C1230" stroke-width="14"/>
+    <path d="M780 750 L780 880 L650 750 Z" fill="url(#violet)"/>
+    <circle cx="560" cy="590" r="22" fill="#FFFFFF" opacity="0.96"/>
+    <g stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" fill="none" opacity="0.96">
+      <path d="M614 547 A58 58 0 0 1 614 633"/>
+      <path d="M672 510 A94 94 0 0 1 672 670"/>
+      <path d="M730 473 A130 130 0 0 1 730 707"/>
+    </g>
+  </g>
+</svg>

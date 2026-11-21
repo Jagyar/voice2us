@@ -17,8 +17,9 @@ rm -f dist/voice2us-macos-arm64 dist/voice2us-macos-amd64
 
 APP="dist/Voice2Us.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp dist/voice2us-macos "$APP/Contents/MacOS/voice2us"
+cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,6 +35,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 	<string>ru.jagyar.voice2us</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
