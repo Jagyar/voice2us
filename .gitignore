@@ -1,0 +1,5 @@
+dist/
+voice2us
+*.test
+*.app
+.DS_Store
