@@ -28,6 +28,7 @@ func main() {
 	s := newAppState(a, w)
 	s.buildUI()
 	s.loadPrefs()
+	s.startBackground()
 	w.ShowAndRun()
 }
 

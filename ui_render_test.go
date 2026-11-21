@@ -18,6 +18,8 @@ import (
 	"fyne.io/fyne/v2/driver/software"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
+
+	"github.com/Jagyar/voice2us/internal/update"
 )
 
 // forced фиксирует вариант темы (светлый/тёмный) независимо от настроек ОС.
@@ -70,6 +72,8 @@ func TestRenderScreens(t *testing.T) {
 		s.updateFooter()
 		s.renderFriends()
 		s.setStatus("Разговор завершён.")
+		version = "2.0.1"
+		s.showUpdateBanner(&update.Release{Tag: "v2.1.0", URL: "https://github.com/x/y"})
 		shot(t, w, filepath.Join(dir, v.name+"-main.png"), v.v, a, 420, 880)
 
 		s.friends = nil

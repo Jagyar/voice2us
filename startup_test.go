@@ -6,6 +6,8 @@ import (
 
 	"fyne.io/fyne/v2/test"
 
+	"github.com/Jagyar/voice2us/internal/update"
+
 	"github.com/Jagyar/voice2us/internal/rdv"
 )
 
@@ -45,4 +47,33 @@ func TestStartupFreshInstall(t *testing.T) {
 	s.buildUI()
 	s.loadPrefs()
 	s.shutdown()
+}
+
+func TestUpdateBanner(t *testing.T) {
+	a := test.NewApp()
+	w := a.NewWindow("Voice2Us")
+	s := newAppState(a, w)
+	s.buildUI()
+	old := version
+	version = "2.0.1"
+	defer func() { version = old }()
+
+	s.onUpdateResult(&update.Release{Tag: "v2.1.0", URL: "https://github.com/x/y/releases/tag/v2.1.0"}, nil, false)
+	if len(s.updateBox.Objects) != 1 {
+		t.Fatal("плашка должна появиться")
+	}
+	s.prefs.SetString(prefSkipVersion, "v2.1.0")
+	s.hideUpdateBanner()
+	s.onUpdateResult(&update.Release{Tag: "v2.1.0", URL: "u"}, nil, false)
+	if len(s.updateBox.Objects) != 0 {
+		t.Fatal("после «Позже» плашка этой версии не возвращается")
+	}
+	s.onUpdateResult(&update.Release{Tag: "v2.2.0", URL: "https://github.com/x/y/releases/tag/v2.2.0"}, nil, false)
+	if len(s.updateBox.Objects) != 1 {
+		t.Fatal("более новая версия должна снова показаться")
+	}
+	s.onUpdateResult(&update.Release{Tag: "v2.0.1", URL: "u"}, nil, false)
+	if len(s.updateBox.Objects) != 0 {
+		t.Fatal("актуальная версия — плашка скрыта")
+	}
 }

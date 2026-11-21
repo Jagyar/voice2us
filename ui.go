@@ -85,6 +85,8 @@ type appState struct {
 
 	// главный экран
 	friendsBox    *fyne.Container
+	updateBox     *fyne.Container // плашка «доступна новая версия»
+	updateResult  *widget.Label
 	statusLabel   *widget.Label
 	footerLabel   *widget.Label
 	nameEntry     *widget.Entry
@@ -176,8 +178,10 @@ func (s *appState) buildMain() {
 	inviteBtn.Importance = widget.HighImportance
 	joinBtn := widget.NewButtonWithIcon("У меня есть код", theme.LoginIcon(), s.onJoin)
 
+	s.updateBox = container.NewVBox()
 	s.mainTop = container.NewVBox(
 		heading("Voice2Us", fyne.TextAlignLeading),
+		s.updateBox,
 		section("Друзья"),
 		s.friendsBox,
 		container.NewGridWithColumns(2, inviteBtn, joinBtn),
@@ -199,10 +203,21 @@ func (s *appState) buildMain() {
 	s.urlResult.Wrapping = fyne.TextWrapWord
 	checkBtn := widget.NewButton("Сохранить и проверить", s.onSaveServer)
 
+	updCheck := widget.NewCheck("Проверять обновления", func(on bool) {
+		s.prefs.SetBool(prefUpdateCheck, on)
+	})
+	updCheck.SetChecked(s.prefs.BoolWithFallback(prefUpdateCheck, true))
+	s.updateResult = widget.NewLabel("")
+	s.updateResult.Importance = widget.LowImportance
+	s.updateResult.Wrapping = fyne.TextWrapWord
+	updNow := widget.NewButton("Проверить сейчас", func() { s.checkUpdates(true) })
+
 	profile := container.NewVBox(
 		widget.NewLabel("Ваше имя"), s.nameEntry,
 		widget.NewLabel("Сервер-«встречалка»"), s.urlEntry,
 		checkBtn, s.urlResult,
+		widget.NewSeparator(),
+		updCheck, updNow, s.updateResult,
 	)
 
 	s.myCodeEntry = widget.NewMultiLineEntry()
@@ -387,10 +402,15 @@ func (s *appState) loadPrefs() {
 	s.pres.SetFriends(s.friends)
 	s.pres.onUpdate = func(id string, st peerStatus) { fyne.Do(func() { s.onPeerStatus(id, st) }) }
 	s.pres.onServer = func(ok bool) { fyne.Do(func() { s.onServerState(ok) }) }
-	go s.pres.Run()
+}
 
-	s.quit = make(chan struct{})
+// startBackground запускает фоновые задачи: статусы друзей, слежение за
+// устройствами, проверку обновлений. Вызывается из main после loadPrefs
+// (тесты запуска обходятся без неё).
+func (s *appState) startBackground() {
+	go s.pres.Run()
 	go s.watchDevices(s.quit)
+	s.startUpdateChecks(s.quit)
 }
 
 func (s *appState) onServerState(ok bool) {
