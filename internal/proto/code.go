@@ -11,8 +11,52 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/netip"
 	"strings"
 )
+
+// maxEndpoints ограничивает число адресов каждого типа: код приходит от
+// стороннего человека, и тысячи адресов превратили бы приложение в источник
+// UDP-флуда.
+const maxEndpoints = 8
+
+// sanitizeEndpoints оставляет только валидные IPv4-литералы ip:port
+// (никаких имён хостов — это были бы DNS-запросы по чужому указанию),
+// без дублей и не более maxEndpoints штук.
+func sanitizeEndpoints(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, s := range in {
+		ap, err := netip.ParseAddrPort(s)
+		if err != nil || !ap.Addr().Is4() || ap.Port() == 0 ||
+			ap.Addr().IsUnspecified() || ap.Addr().IsMulticast() {
+			continue
+		}
+		str := ap.String()
+		if seen[str] {
+			continue
+		}
+		seen[str] = true
+		out = append(out, str)
+		if len(out) >= maxEndpoints {
+			break
+		}
+	}
+	return out
+}
+
+// SameCode reports whether two codes describe the same peer half
+// (used to detect that the user pasted their own code).
+func SameCode(a, b *Code) bool {
+	if a == nil || b == nil || a.Role != b.Role {
+		return false
+	}
+	if a.Role == RoleA {
+		return bytes.Equal(a.Key, b.Key)
+	}
+	return a.Name == b.Name && strings.Join(a.Public, ",") == strings.Join(b.Public, ",") &&
+		strings.Join(a.LAN, ",") == strings.Join(b.LAN, ",")
+}
 
 const codeMagic = "V2U1."
 
@@ -93,6 +137,8 @@ func UnmarshalCode(s string) (*Code, error) {
 	if c.Role == RoleA && len(c.Key) != 32 {
 		return nil, errors.New("в коде нет ключа сессии")
 	}
+	c.Public = sanitizeEndpoints(c.Public)
+	c.LAN = sanitizeEndpoints(c.LAN)
 	if runes := []rune(c.Name); len(runes) > 64 {
 		c.Name = string(runes[:64])
 	}

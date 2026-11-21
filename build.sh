@@ -6,8 +6,14 @@ cd "$(dirname "$0")"
 
 mkdir -p dist
 
-echo "==> сборка macOS (arm64)..."
-go build -trimpath -ldflags "-s -w" -o dist/voice2us-macos .
+echo "==> сборка macOS (universal: arm64 + amd64)..."
+for arch in arm64 amd64; do
+	GOOS=darwin GOARCH=$arch CGO_ENABLED=1 \
+		CC="clang -arch $([ $arch = arm64 ] && echo arm64 || echo x86_64)" \
+		go build -trimpath -ldflags "-s -w" -o dist/voice2us-macos-$arch .
+done
+lipo -create -output dist/voice2us-macos dist/voice2us-macos-arm64 dist/voice2us-macos-amd64
+rm -f dist/voice2us-macos-arm64 dist/voice2us-macos-amd64
 
 APP="dist/Voice2Us.app"
 rm -rf "$APP"

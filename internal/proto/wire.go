@@ -36,6 +36,7 @@ const (
 	wireSeqBytes = 4
 	wireOverhead = wireSeqBytes + 16 // seq32 + Poly1305 tag
 	maxPlaintext = 4096
+	replayWindow = 64 // сколько последних номеров помним для анти-replay
 )
 
 // Role tells which side of the call we are. It fixes the direction of our
@@ -70,6 +71,7 @@ type Crypto struct {
 	recvMu   sync.Mutex
 	recvInit bool
 	recvLast uint64
+	recvMask uint64 // бит i = получен пакет с номером recvLast-i
 }
 
 // NewCrypto splits the 32-byte session key into per-direction keys.
@@ -150,7 +152,8 @@ func (c *Crypto) Open(wire []byte) (byte, []byte, error) {
 }
 
 // peekSeq реконструирует полный 64-битный счётчик из усечённого, не меняя
-// состояние: false = повтор или пакет старше последнего принятого.
+// состояние. false = повтор или пакет старше окна в replayWindow номеров.
+// Небольшое окно позволяет принимать слегка переупорядоченные пакеты.
 func (c *Crypto) peekSeq(seq32 uint32) (uint64, bool) {
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
@@ -159,18 +162,38 @@ func (c *Crypto) peekSeq(seq32 uint32) (uint64, bool) {
 		return uint64(seq32), true
 	}
 	delta := int32(seq32 - uint32(c.recvLast))
-	if delta <= 0 {
+	if delta > 0 {
+		return c.recvLast + uint64(delta), true
+	}
+	back := uint64(-int64(delta))
+	if back >= replayWindow || back > c.recvLast {
 		return 0, false
 	}
-	return c.recvLast + uint64(delta), true
+	if c.recvMask&(1<<back) != 0 {
+		return 0, false // уже принимали
+	}
+	return c.recvLast - back, true
 }
 
 // commitSeq фиксирует счётчик после успешной расшифровки.
 func (c *Crypto) commitSeq(seq uint64) {
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
-	c.recvLast = seq
-	c.recvInit = true
+	switch {
+	case !c.recvInit:
+		c.recvInit = true
+		c.recvLast = seq
+		c.recvMask = 1
+	case seq > c.recvLast:
+		if shift := seq - c.recvLast; shift >= replayWindow {
+			c.recvMask = 1
+		} else {
+			c.recvMask = c.recvMask<<shift | 1
+		}
+		c.recvLast = seq
+	default:
+		c.recvMask |= 1 << (c.recvLast - seq)
+	}
 }
 
 func nonce(prefix [4]byte, seq uint64) []byte {

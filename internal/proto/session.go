@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -401,7 +402,7 @@ func lanAddrs(port int) []string {
 		return nil
 	}
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || virtualIface(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -409,10 +410,22 @@ func lanAddrs(port int) []string {
 			continue
 		}
 		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLinkLocalUnicast() {
 				out = append(out, fmt.Sprintf("%s:%d", ipn.IP.String(), port))
 			}
 		}
 	}
 	return out
+}
+
+// virtualIface отсеивает интерфейсы контейнеров и виртуалок: их адреса
+// бесполезны другу и лишь раскрывают лишнее о вашей машине.
+func virtualIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range []string{"docker", "veth", "br-", "virbr", "vmnet", "vboxnet", "vethernet", "utun", "awdl", "llw", "bridge"} {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
 }

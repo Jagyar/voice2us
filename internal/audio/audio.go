@@ -62,9 +62,10 @@ type Engine struct {
 	spkVol  atomic.Uint64
 	micMute atomic.Bool
 
-	micRing  *ring // захват -> сеть
-	jitRing  *ring // сеть -> воспроизведение (джиттер-буфер)
-	starving bool  // только из playback-колбэка (один поток)
+	micRing  *ring       // захват -> сеть
+	jitRing  *ring       // сеть -> воспроизведение (джиттер-буфер)
+	starving atomic.Bool // playback-колбэк + ResetBuffers из другого потока
+	capTmp   []int16     // только из capture-колбэка
 	scratch  []int16
 }
 
@@ -79,6 +80,7 @@ func NewEngine() (*Engine, error) {
 		jitRing: newRing(jitterRingCap),
 		scratch: make([]int16, FrameSamples*4),
 	}
+	e.starving.Store(true)
 	e.SetMicVolume(1)
 	e.SetSpkVolume(1)
 	return e, nil
@@ -253,7 +255,7 @@ func (e *Engine) StopDevices() {
 func (e *Engine) ResetBuffers() {
 	e.micRing.reset()
 	e.jitRing.reset()
-	e.starving = true
+	e.starving.Store(true)
 }
 
 // WriteReceived pushes a decoded frame into the jitter buffer.
@@ -299,7 +301,10 @@ func (e *Engine) onCaptureData(_, input []byte, _ uint32) {
 	if n == 0 {
 		return
 	}
-	tmp := make([]int16, n)
+	if cap(e.capTmp) < n {
+		e.capTmp = make([]int16, n)
+	}
+	tmp := e.capTmp[:n]
 	for i := 0; i < n; i++ {
 		tmp[i] = int16(binary.LittleEndian.Uint16(input[i*2:]))
 	}
@@ -318,11 +323,11 @@ func (e *Engine) onPlaybackData(output, _ []byte, _ uint32) {
 
 	vol := math.Float64frombits(e.spkVol.Load())
 
-	if e.starving {
+	if e.starving.Load() {
 		if e.jitRing.available() < jitterPrebuffer {
 			return
 		}
-		e.starving = false
+		e.starving.Store(false)
 	}
 
 	n := need
@@ -331,7 +336,7 @@ func (e *Engine) onPlaybackData(output, _ []byte, _ uint32) {
 	}
 	n = e.jitRing.read(e.scratch[:n])
 	if n < need {
-		e.starving = true // недобор — выдаём тишину, копим предбуфер
+		e.starving.Store(true) // недобор — выдаём тишину, копим предбуфер
 	}
 	if vol == 0 {
 		return

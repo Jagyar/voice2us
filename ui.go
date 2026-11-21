@@ -68,10 +68,10 @@ func newAppState(a fyne.App, w fyne.Window) *appState {
 		engine = nil // покажем ошибку в интерфейсе, не роняя приложение
 	}
 	return &appState{
-		app:     a,
-		win:     w,
-		prefs:   a.Preferences(),
-		engine:  engine,
+		app:    a,
+		win:    w,
+		prefs:  a.Preferences(),
+		engine: engine,
 	}
 }
 
@@ -232,10 +232,13 @@ func (s *appState) onCreateCode() {
 	s.createBtn.Disable()
 	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
+	name := s.nameEntry.Text
+	have, haveConn := s.myCode, s.conn // снимок: фоновая горутина UI-состояние не трогает
 
 	go func() {
-		warn, err := s.ensureMyCode(proto.RoleA)
+		conn, code, warn, err := s.prepareCode(have, haveConn, proto.RoleA, name)
 		fyne.Do(func() {
+			s.applyCode(conn, code)
 			s.createBtn.Enable()
 			s.connectBtn.Enable()
 			if err != nil {
@@ -267,7 +270,7 @@ func (s *appState) onPeerCode() {
 		s.setStatus("Код друга не распознан: " + err.Error())
 		return
 	}
-	if s.myCode != nil && s.myCode.Role == peer.Role && s.myCode.Name == peer.Name {
+	if s.myCode != nil && proto.SameCode(s.myCode, peer) {
 		s.setStatus("Это похоже на ваш собственный код — нужен код друга.")
 		return
 	}
@@ -275,10 +278,13 @@ func (s *appState) onPeerCode() {
 	s.createBtn.Disable()
 	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
+	name := s.nameEntry.Text
+	have, haveConn := s.myCode, s.conn // снимок: фоновая горутина UI-состояние не трогает
 
 	go func() {
-		warn, err := s.ensureMyCode(proto.Opposite(peer.Role))
+		conn, code, warn, err := s.prepareCode(have, haveConn, proto.Opposite(peer.Role), name)
 		fyne.Do(func() {
+			s.applyCode(conn, code)
 			s.createBtn.Enable()
 			s.connectBtn.Enable()
 			if err != nil {
@@ -295,52 +301,58 @@ func (s *appState) onPeerCode() {
 	}()
 }
 
-// ensureMyCode гарантирует, что у нас есть код нужной роли: при необходимости
-// открывает UDP-сокет, находит адреса через STUN и пересоздаёт код.
-// Возвращает предупреждение (пустую строку, если всё хорошо) и ошибку.
-func (s *appState) ensureMyCode(role proto.Role) (string, error) {
-	if s.myCode != nil && s.myCode.Role == role {
-		return "", nil
+// prepareCode готовит код нужной роли и сокет. Работает в фоне и не трогает
+// состояние UI: возвращает результат, который applyCode применит на
+// главном потоке. have/haveConn — снимок текущих значений.
+// Возвращает предупреждение (пусто, если всё хорошо) и ошибку.
+func (s *appState) prepareCode(have *proto.Code, haveConn *net.UDPConn, role proto.Role, name string) (*net.UDPConn, *proto.Code, string, error) {
+	if have != nil && have.Role == role {
+		return haveConn, have, "", nil
 	}
-	if s.conn == nil {
-		conn, err := net.ListenUDP("udp4", nil)
+	conn := haveConn
+	if conn == nil {
+		c, err := net.ListenUDP("udp4", nil)
 		if err != nil {
-			return "", fmt.Errorf("не удалось открыть UDP-порт: %w", err)
+			return nil, nil, "", fmt.Errorf("не удалось открыть UDP-порт: %w", err)
 		}
-		s.conn = conn
+		conn = c
 	}
 
-	public, lan := proto.DiscoverEndpoints(s.conn, stunServers(), 800*time.Millisecond)
+	public, lan := proto.DiscoverEndpoints(conn, stunServers(), 800*time.Millisecond)
 	if len(public) == 0 && len(lan) == 0 {
-		return "", fmt.Errorf("не удалось определить ни одного адреса — проверьте интернет")
+		return conn, nil, "", fmt.Errorf("не удалось определить ни одного адреса — проверьте интернет")
 	}
 	warn := ""
 	if len(public) == 0 {
 		warn = "публичный адрес не определён (STUN недоступен) — связь возможна только в одной локальной сети"
 	}
 
-	name := s.nameEntry.Text
 	if name == "" {
 		name = "Без имени"
 	}
-
 	code := &proto.Code{
-		Name: name,
-		Role: role,
-		Endpoints: proto.Endpoints{
-			Public: public,
-			LAN:    lan,
-		},
+		Name:      name,
+		Role:      role,
+		Endpoints: proto.Endpoints{Public: public, LAN: lan},
 	}
 	if role == proto.RoleA {
 		key := make([]byte, 32)
 		if _, err := rand.Read(key); err != nil {
-			return "", err
+			return conn, nil, "", err
 		}
 		code.Key = key
 	}
-	s.myCode = code
-	return warn, nil
+	return conn, code, warn, nil
+}
+
+// applyCode (UI-поток) сохраняет сокет и код, подготовленные prepareCode.
+func (s *appState) applyCode(conn *net.UDPConn, code *proto.Code) {
+	if conn != nil {
+		s.conn = conn
+	}
+	if code != nil {
+		s.myCode = code
+	}
 }
 
 func (s *appState) startSession(peer *proto.Code) {
@@ -546,11 +558,13 @@ func (s *appState) showMain(status string) {
 }
 
 func (s *appState) shutdown() {
-	if s.cancel != nil {
-		s.cancel()
-	}
+	// Сначала Stop (шлёт bye), потом cancel: иначе отмена контекста
+	// успевает занять stopOnce, и друг не получит прощальный пакет.
 	if s.session != nil {
 		s.session.Stop()
+	}
+	if s.cancel != nil {
+		s.cancel()
 	}
 	if s.conn != nil {
 		_ = s.conn.Close()
