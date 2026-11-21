@@ -14,8 +14,8 @@
 
 ## Как пользоваться
 
-1. Каждый скачивает свою сборку (`dist/`): `Voice2Us.app` для macOS,
-   `Voice2Us.exe` для Windows.
+1. Каждый скачивает свою сборку со страницы
+   [Releases](../../releases/latest): `.dmg` для macOS, `.exe` для Windows.
 2. macOS: правый клик по приложению → «Открыть» (один раз, приложение без
    сертификата). При первом запуске разрешить доступ к микрофону.
    Windows: SmartScreen → «Подробнее» → «Выполнить в любом случае».
@@ -44,10 +44,20 @@
 Нужны: Go 1.26+, Xcode CLT (macOS), mingw-w64 (для сборки .exe с мака).
 
 ```bash
-./build.sh
+./build.sh              # всё: dist/Voice2Us.dmg (universal) и dist/Voice2Us.exe
+./build.sh mac          # только macOS
+VERSION=1.2.0 ./build.sh mac
 ```
 
-Собирает `dist/Voice2Us.app` (macOS, arm64) и `dist/Voice2Us.exe` (Windows, x64).
+## Выпуск релиза
+
+Релизы собирает GitHub Actions (`.github/workflows/release.yml`): достаточно
+запушить тег — на странице Releases появятся `.dmg` и `.exe`.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 Полезно: `./voice2us --devices` — напечатать список аудиоустройств и выйти.
 

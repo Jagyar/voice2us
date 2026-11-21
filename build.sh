@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Собирает Voice2Us.app + Voice2Us.dmg для macOS и Voice2Us.exe для Windows.
+# Собирает Voice2Us для macOS (.app + .dmg) и Windows (.exe).
+# Использование: ./build.sh [mac|win|all]   (по умолчанию all)
+# Версия: VERSION=1.2.3 ./build.sh  (по умолчанию 1.0.0)
 # Требуется: go, Xcode CLT, mingw-w64 (brew install mingw-w64).
 set -euo pipefail
 cd "$(dirname "$0")"
 
+TARGET="${1:-all}"
+VERSION="${VERSION:-1.0.0}"
 mkdir -p dist
 
+build_mac() {
 echo "==> сборка macOS (universal: arm64 + amd64)..."
 for arch in arm64 amd64; do
 	GOOS=darwin GOARCH=$arch CGO_ENABLED=1 \
@@ -38,7 +43,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 	<key>CFBundleIconFile</key>
 	<string>icon</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSHighResolutionCapable</key>
@@ -50,23 +55,38 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+sed -i.bak "s/@VERSION@/$VERSION/" "$APP/Contents/Info.plist" && rm "$APP/Contents/Info.plist.bak"
 codesign --force -s - "$APP" 2>/dev/null || true
 echo "    готово: $APP"
 
-echo "==> упаковка DMG..."
-rm -f dist/Voice2Us.dmg
-hdiutil create -volname Voice2Us -srcfolder "$APP" -ov -format UDZO dist/Voice2Us.dmg >/dev/null
+rm -f dist/Voice2Us-mac.zip dist/Voice2Us.dmg
+hdiutil create -quiet -volname "Voice2Us $VERSION" -srcfolder "$APP" -ov -format UDZO dist/Voice2Us.dmg
 echo "    готово: dist/Voice2Us.dmg"
+}
+
+build_win() {
 
 echo "==> сборка Windows (x64)..."
-GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
-	go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
+if [ "$(go env GOOS)" = windows ]; then
+	CGO_ENABLED=1 go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
+else
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+		go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/Voice2Us.exe .
+fi
 echo "    готово: dist/Voice2Us.exe"
+}
 
-( cd dist && zip -qr Voice2Us-mac.zip Voice2Us.app && zip -qr Voice2Us-windows.zip Voice2Us.exe )
+case "$TARGET" in
+	mac) build_mac ;;
+	win) build_win ;;
+	all) build_mac; build_win ;;
+	*) echo "usage: $0 [mac|win|all]"; exit 1 ;;
+esac
 
-echo "==> контрольные тесты..."
-go test -race -count=1 -timeout 120s ./... >/dev/null && echo "    тесты: OK"
+if [ -z "${CI:-}" ]; then
+	echo "==> контрольные тесты..."
+	go test -race -count=1 -timeout 120s ./... >/dev/null && echo "    тесты: OK"
+fi
 
 echo "==> итог в dist/:"
-ls -lh dist/ | awk '{print "    " $9, $5}'
+ls -lh dist/
