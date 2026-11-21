@@ -123,6 +123,7 @@ func newAppState(a fyne.App, w fyne.Window) *appState {
 		win:      w,
 		prefs:    a.Preferences(),
 		engine:   engine,
+		pres:     newPresence(),
 		statuses: map[string]peerStatus{},
 		handled:  map[string]bool{},
 		quit:     make(chan struct{}),
@@ -381,7 +382,6 @@ func (s *appState) loadPrefs() {
 	s.renderFriends()
 	s.updateFooter()
 
-	s.pres = newPresence()
 	s.pres.SetName(s.prefs.String("name"))
 	s.pres.SetClient(s.rdvc)
 	s.pres.SetFriends(s.friends)
