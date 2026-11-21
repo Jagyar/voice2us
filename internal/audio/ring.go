@@ -22,6 +22,11 @@ func (r *ring) write(s []int16) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if len(s) >= len(r.buf) {
+		// Запись больше ёмкости: оставляем только последние cap сэмплов.
+		s = s[len(s)-len(r.buf):]
+		r.r = r.w
+	}
 	avail := len(r.buf) - int(r.w-r.r)
 	if avail < len(s) {
 		r.r += uint64(len(s) - avail) // выбрасываем самое старое
@@ -59,4 +64,11 @@ func (r *ring) available() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return int(r.w - r.r)
+}
+
+// reset выбрасывает всё содержимое (при переподключении сессии).
+func (r *ring) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.r, r.w = 0, 0
 }

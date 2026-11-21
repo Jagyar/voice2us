@@ -127,41 +127,50 @@ func (c *Crypto) Seal(buf, payload []byte, seq uint64, pktType byte) []byte {
 }
 
 // Open validates and decrypts a wire packet, returning its type and payload.
-// Packets that are too old, replayed or forged are rejected.
+// Packets that are too old, replayed or forged are rejected. Важно: счётчик
+// анти-replay сдвигается ТОЛЬКО после успешной расшифровки — иначе мусорный
+// пакет (неверный ключ) отравил бы окно, и валидные пакеты с меньшими
+// номерами отбрасывались бы как «устаревшие».
 func (c *Crypto) Open(wire []byte) (byte, []byte, error) {
 	if len(wire) < wireOverhead || len(wire) > wireOverhead+maxPlaintext {
 		return 0, nil, errors.New("пакет неверного размера")
 	}
 
-	seq64, err := c.extendSeq(binary.BigEndian.Uint32(wire[:wireSeqBytes]))
-	if err != nil {
-		return 0, nil, err
+	seq64, ok := c.peekSeq(binary.BigEndian.Uint32(wire[:wireSeqBytes]))
+	if !ok {
+		return 0, nil, errors.New("повтор или устаревший пакет")
 	}
 
 	plain, err := c.recv.Open(nil, nonce(c.recvPrefix, seq64), wire[wireSeqBytes:], nil)
 	if err != nil {
 		return 0, nil, err
 	}
+	c.commitSeq(seq64)
 	return plain[0], plain[1:], nil
 }
 
-// extendSeq reconstructs the full 64-bit counter from its truncated form,
-// rejecting replays and packets older than the last accepted one.
-func (c *Crypto) extendSeq(seq32 uint32) (uint64, error) {
+// peekSeq реконструирует полный 64-битный счётчик из усечённого, не меняя
+// состояние: false = повтор или пакет старше последнего принятого.
+func (c *Crypto) peekSeq(seq32 uint32) (uint64, bool) {
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
 
 	if !c.recvInit {
-		c.recvInit = true
-		c.recvLast = uint64(seq32)
-		return c.recvLast, nil
+		return uint64(seq32), true
 	}
 	delta := int32(seq32 - uint32(c.recvLast))
 	if delta <= 0 {
-		return 0, errors.New("повтор или устаревший пакет")
+		return 0, false
 	}
-	c.recvLast += uint64(delta)
-	return c.recvLast, nil
+	return c.recvLast + uint64(delta), true
+}
+
+// commitSeq фиксирует счётчик после успешной расшифровки.
+func (c *Crypto) commitSeq(seq uint64) {
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
+	c.recvLast = seq
+	c.recvInit = true
 }
 
 func nonce(prefix [4]byte, seq uint64) []byte {

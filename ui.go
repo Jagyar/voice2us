@@ -1,13 +1,14 @@
 package main
 
 // Весь интерфейс: главный экран (обмен кодами подключения) и экран
-// разговора (устройства, громкость, mute, «поверх всех окон»).
+// разговора (устройства, громкость, mute).
 
 import (
 	"context"
 	"crypto/rand"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -31,6 +32,7 @@ type appState struct {
 	session *proto.Session
 	cancel  context.CancelFunc
 
+	reasonMu        sync.Mutex // защищает stopReason: пишут и pump, и UI-поток
 	stopReason      string
 	updatingDevices bool
 
@@ -212,6 +214,11 @@ func (s *appState) loadPrefs() {
 	s.spkSlider.Refresh()
 	s.micPct.SetText(fmt.Sprintf("%.0f%%", micVol))
 	s.spkPct.SetText(fmt.Sprintf("%.0f%%", spkVol))
+	// Слайдеры выше только красят цифры — применяем громкости к движку сразу.
+	if s.engine != nil {
+		s.engine.SetMicVolume(micVol / 100)
+		s.engine.SetSpkVolume(spkVol / 100)
+	}
 }
 
 // --- главный экран ---
@@ -223,12 +230,14 @@ func (s *appState) onCreateCode() {
 	}
 	s.prefs.SetString("name", s.nameEntry.Text)
 	s.createBtn.Disable()
+	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
 
 	go func() {
-		err := s.ensureMyCode(proto.RoleA)
+		warn, err := s.ensureMyCode(proto.RoleA)
 		fyne.Do(func() {
 			s.createBtn.Enable()
+			s.connectBtn.Enable()
 			if err != nil {
 				s.setStatus("Ошибка: " + err.Error())
 				return
@@ -239,6 +248,10 @@ func (s *appState) onCreateCode() {
 				return
 			}
 			s.myCodeEntry.SetText(codeStr)
+			if warn != "" {
+				s.setStatus("Код готов, но: " + warn)
+				return
+			}
 			s.setStatus("Код готов — отправьте его другу и ждите ответного кода.")
 		})
 	}()
@@ -259,12 +272,14 @@ func (s *appState) onPeerCode() {
 		return
 	}
 	s.prefs.SetString("name", s.nameEntry.Text)
+	s.createBtn.Disable()
 	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
 
 	go func() {
-		err := s.ensureMyCode(proto.Opposite(peer.Role))
+		warn, err := s.ensureMyCode(proto.Opposite(peer.Role))
 		fyne.Do(func() {
+			s.createBtn.Enable()
 			s.connectBtn.Enable()
 			if err != nil {
 				s.setStatus("Ошибка: " + err.Error())
@@ -273,27 +288,35 @@ func (s *appState) onPeerCode() {
 			codeStr, _ := proto.MarshalCode(s.myCode)
 			s.myCodeEntry.SetText(codeStr)
 			s.startSession(peer)
+			if warn != "" {
+				s.setStatus(s.statusLabel.Text + " " + warn)
+			}
 		})
 	}()
 }
 
 // ensureMyCode гарантирует, что у нас есть код нужной роли: при необходимости
 // открывает UDP-сокет, находит адреса через STUN и пересоздаёт код.
-func (s *appState) ensureMyCode(role proto.Role) error {
+// Возвращает предупреждение (пустую строку, если всё хорошо) и ошибку.
+func (s *appState) ensureMyCode(role proto.Role) (string, error) {
 	if s.myCode != nil && s.myCode.Role == role {
-		return nil
+		return "", nil
 	}
 	if s.conn == nil {
 		conn, err := net.ListenUDP("udp4", nil)
 		if err != nil {
-			return fmt.Errorf("не удалось открыть UDP-порт: %w", err)
+			return "", fmt.Errorf("не удалось открыть UDP-порт: %w", err)
 		}
 		s.conn = conn
 	}
 
 	public, lan := proto.DiscoverEndpoints(s.conn, stunServers(), 800*time.Millisecond)
 	if len(public) == 0 && len(lan) == 0 {
-		return fmt.Errorf("не удалось определить ни одного адреса — проверьте интернет")
+		return "", fmt.Errorf("не удалось определить ни одного адреса — проверьте интернет")
+	}
+	warn := ""
+	if len(public) == 0 {
+		warn = "публичный адрес не определён (STUN недоступен) — связь возможна только в одной локальной сети"
 	}
 
 	name := s.nameEntry.Text
@@ -312,12 +335,12 @@ func (s *appState) ensureMyCode(role proto.Role) error {
 	if role == proto.RoleA {
 		key := make([]byte, 32)
 		if _, err := rand.Read(key); err != nil {
-			return err
+			return "", err
 		}
 		code.Key = key
 	}
 	s.myCode = code
-	return nil
+	return warn, nil
 }
 
 func (s *appState) startSession(peer *proto.Code) {
@@ -332,7 +355,7 @@ func (s *appState) startSession(peer *proto.Code) {
 		return
 	}
 
-	s.stopReason = ""
+	s.setReason("")
 	s.session = sess
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -357,6 +380,9 @@ func (s *appState) pump(sess *proto.Session, ctx context.Context) {
 		case ev := <-sess.Events():
 			switch ev.Kind {
 			case proto.EvConnected:
+				if s.engine != nil {
+					s.engine.ResetBuffers() // выкинуть накопленное за время разрыва
+				}
 				fyne.Do(func() { s.showCall(ev.Peer) })
 			case proto.EvLost:
 				fyne.Do(func() {
@@ -364,18 +390,21 @@ func (s *appState) pump(sess *proto.Session, ctx context.Context) {
 					s.rttLabel.SetText("")
 				})
 			case proto.EvStalled:
-				fyne.Do(func() {
-					s.callStatus.SetText("Долго не удаётся соединиться. Проверьте коды или создайте новые.")
-				})
+				// 90 секунд без успеха: прекращаем попытки и возвращаемся
+				// на главный экран — нужен новый обмен кодами.
+				s.setReason("Долго не удалось соединиться — сделайте новый обмен кодами.")
+				sess.Stop()
 			case proto.EvRTT:
 				rtt := ev.RTTms
 				fyne.Do(func() { s.rttLabel.SetText(fmt.Sprintf("Задержка: %d мс", rtt)) })
 			case proto.EvPeerBye:
-				s.stopReason = "Друг завершил разговор."
+				s.setReason("Друг завершил разговор.")
 				sess.Stop()
 			case proto.EvStopped:
 				s.cancel()
-				s.finishCall()
+				reason := s.takeReason()
+				// Мутации UI — только на главном потоке Fyne.
+				fyne.Do(func() { s.finishCall(reason) })
 				return
 			}
 		case frame := <-sess.InFrames():
@@ -477,22 +506,37 @@ func pickDevice(names []string, list []audio.Device, preferred string) string {
 }
 
 func (s *appState) hangup() {
-	s.stopReason = "Разговор завершён."
+	s.setReason("Разговор завершён.")
 	if s.session != nil {
 		s.session.Stop()
 	}
 }
 
-// finishCall вызывается, когда сессия полностью закончилась.
-func (s *appState) finishCall() {
+func (s *appState) setReason(r string) {
+	s.reasonMu.Lock()
+	s.stopReason = r
+	s.reasonMu.Unlock()
+}
+
+func (s *appState) takeReason() string {
+	s.reasonMu.Lock()
+	defer s.reasonMu.Unlock()
+	r := s.stopReason
+	s.stopReason = ""
+	return r
+}
+
+// finishCall вызывается на UI-потоке, когда сессия полностью закончилась.
+func (s *appState) finishCall(reason string) {
 	if s.engine != nil {
 		s.engine.StopDevices()
 	}
 	s.session = nil
-	if s.stopReason == "" {
-		s.stopReason = "Отключено."
+	s.myCode = nil // новый разговор — новый ключ сессии и свежие адреса
+	if reason == "" {
+		reason = "Отключено."
 	}
-	s.showMain(s.stopReason)
+	s.showMain(reason)
 }
 
 func (s *appState) showMain(status string) {
@@ -507,6 +551,9 @@ func (s *appState) shutdown() {
 	}
 	if s.session != nil {
 		s.session.Stop()
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
 	}
 	if s.engine != nil {
 		s.engine.Close()

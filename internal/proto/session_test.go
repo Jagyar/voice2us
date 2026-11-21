@@ -113,3 +113,66 @@ func waitAudio(t *testing.T, s *Session, d time.Duration) []int16 {
 }
 
 const FrameSamplesForTest = 480
+
+// TestSessionSocketReuse — регрессия на P0: сокет переживает сессию, поэтому
+// второй разговор на тех же сокетах (с новым ключом) обязан работать.
+func TestSessionSocketReuse(t *testing.T) {
+	connA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("connA=%s connB=%s", connA.LocalAddr(), connB.LocalAddr())
+
+	runCall := func(t *testing.T, n int) {
+		t.Helper()
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			t.Fatal(err)
+		}
+		codeA := &Code{Name: "Аня", Role: RoleA, Key: key,
+			Endpoints: Endpoints{Public: []string{connA.LocalAddr().String()}}}
+		codeB := &Code{Name: "Боря", Role: RoleB,
+			Endpoints: Endpoints{Public: []string{connB.LocalAddr().String()}}}
+
+		sessA, err := NewSession(connA, codeA, codeB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessB, err := NewSession(connB, codeB, codeA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		go sessA.Run(ctx)
+		go sessB.Run(ctx)
+
+		waitEvent(t, sessA, EvConnected, 3*time.Second)
+		waitEvent(t, sessB, EvConnected, 3*time.Second)
+
+		frame := make([]int16, FrameSamplesForTest)
+		for i := range frame {
+			frame[i] = int16(n*100 + i)
+		}
+		sessA.SendAudio(frame)
+		got := waitAudio(t, sessB, 3*time.Second)
+		if got[0] != frame[0] || got[len(got)-1] != frame[len(frame)-1] {
+			t.Fatalf("звонок %d: кадр исказился", n)
+		}
+
+		sessB.Stop()
+		waitEvent(t, sessA, EvStopped, 3*time.Second)
+		sessA.Stop()
+		// Дожидаемся полного завершения ОБОИХ сессий: recvLoop второй
+		// стороны выходит по таймауту чтения (до 200 мс), и живой «зомби»-
+		// цикл мог бы съесть пакет следующего звонка на том же сокете.
+		waitEvent(t, sessB, EvStopped, 3*time.Second)
+	}
+
+	runCall(t, 1)
+	runCall(t, 2) // тот же сокет, тот же порт — второй звонок должен подняться
+}

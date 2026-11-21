@@ -103,20 +103,28 @@ func (s *Session) InFrames() <-chan []int16 { return s.inFrames }
 func (s *Session) IsConnected() bool        { return s.connected.Load() }
 
 // SendAudio queues one PCM frame (mono 48 kHz, s16le samples) for sending.
+// The frame is copied, so the caller may reuse its buffer immediately.
 // Frames are dropped if the queue is full — live audio prefers fresh data.
 func (s *Session) SendAudio(frame []int16) {
+	cp := make([]int16, len(frame))
+	copy(cp, frame)
 	select {
-	case s.outAudio <- frame:
+	case s.outAudio <- cp:
 	default:
 	}
 }
 
-// Stop tears the session down: sends bye (if connected), closes the socket.
+// Stop tears the session down: sends bye (three times, UDP is lossy —
+// losing the only one would leave the peer in "reconnecting" forever).
+// The UDP socket is NOT closed: it belongs to the caller and must stay
+// usable for the next call (its NAT mapping is what the peer's code has).
 func (s *Session) Stop() {
 	s.stopOnce.Do(func() {
 		if a := s.remote.Load(); a != nil && s.connected.Load() {
-			wire := s.cr.Seal(nil, nil, s.seq.Add(1)-1, PktBye)
-			_, _ = s.conn.WriteToUDP(wire, a)
+			for i := 0; i < 3; i++ {
+				wire := s.cr.Seal(nil, nil, s.seq.Add(1)-1, PktBye)
+				_, _ = s.conn.WriteToUDP(wire, a)
+			}
 		}
 		s.doShutdown()
 	})
@@ -132,18 +140,40 @@ func (s *Session) shutdown() {
 func (s *Session) doShutdown() {
 	s.connected.Store(false)
 	close(s.stopCh)
-	_ = s.conn.Close()
+	// Сокет намеренно не закрываем — он общий на несколько разговоров
+	// и принадлежит владельцу (см. Stop).
 }
 
 // Run blocks until the session ends (stop, peer bye or ctx cancelled).
+// EvStopped излучается только когда завершились ВСЕ горутины сессии,
+// включая recvLoop (тот выходит по таймауту чтения, до 200 мс): после
+// события сокет гарантированно свободен для следующего разговора.
 func (s *Session) Run(ctx context.Context) {
-	defer func() {
-		s.shutdown()
-		s.emit(Event{Kind: EvStopped})
-	}()
-	go s.recvLoop()
-	go s.audioOut()
+	s.drainSocket()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); s.recvLoop() }()
+	go func() { defer wg.Done(); s.audioOut() }()
+
 	s.sendLoop(ctx)
+	s.shutdown() // если вышли по ctx/bye — остановим остальных
+	wg.Wait()
+	s.emit(Event{Kind: EvStopped})
+}
+
+// drainSocket вычитывает и выбрасывает всё, что осталось в буфере приёма
+// от прошлых сессий на этом сокете — иначе хвосты старого разговора
+// попадут в новый и будут отброшены уже в процессе.
+func (s *Session) drainSocket() {
+	_ = s.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 2048)
+	for {
+		if _, _, err := s.conn.ReadFromUDP(buf); err != nil {
+			break
+		}
+	}
+	_ = s.conn.SetReadDeadline(time.Time{})
 }
 
 func (s *Session) emit(ev Event) {
@@ -172,10 +202,22 @@ func (s *Session) peerAddrs() []*net.UDPAddr {
 func (s *Session) recvLoop() {
 	buf := make([]byte, 2048)
 	for {
+		// Читаем с коротким дедлайном: сокет остаётся открытым и после
+		// сессии, поэтому единственный способ выйти — заметить stopCh
+		// между таймаутами чтения.
+		_ = s.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		n, src, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				select {
+				case <-s.stopCh:
+					return
+				default:
+				}
 			}
 			continue
 		}

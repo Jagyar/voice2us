@@ -74,7 +74,8 @@ func UnmarshalCode(s string) (*Code, error) {
 	if err != nil {
 		return nil, errors.New("код повреждён")
 	}
-	rawJSON, err := io.ReadAll(zr)
+	// Лимит на случай «gzip-бомбы» во вставленном тексте.
+	rawJSON, err := io.ReadAll(io.LimitReader(zr, 64*1024))
 	if err != nil {
 		return nil, errors.New("код повреждён")
 	}
@@ -91,6 +92,9 @@ func UnmarshalCode(s string) (*Code, error) {
 	}
 	if c.Role == RoleA && len(c.Key) != 32 {
 		return nil, errors.New("в коде нет ключа сессии")
+	}
+	if runes := []rune(c.Name); len(runes) > 64 {
+		c.Name = string(runes[:64])
 	}
 	return &c, nil
 }

@@ -37,7 +37,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Микрофон нужен для голосового чата с другом.</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>10.14</string>
+	<string>11.0</string>
 </dict>
 </plist>
 EOF

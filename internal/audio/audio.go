@@ -3,11 +3,19 @@
 //
 // Fixed audio format everywhere: mono, 48 kHz, s16le — raw PCM goes over
 // the network uncompressed, so "отличное качество" is the codec's default.
+//
+// ВАЖНО про потоки: device-колбэки malgo выполняются на потоках miniaudio
+// и НЕ должны брать e.mu — на Windows (WASAPI) ma_device_uninit/stop ждут
+// завершения колбэк-потока, и мьютекс в колбэке дал бы вечный дедлок.
+// Поэтому громкость/mute — атомики, а e.mu охраняет только состояние
+// устройств (взятие/высвобождение) и списки устройств.
 package audio
 
 import (
 	"encoding/binary"
+	"math"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/gen2brain/malgo"
@@ -41,20 +49,23 @@ type Device struct {
 type Engine struct {
 	ctx *malgo.AllocatedContext
 
-	mu      sync.Mutex
-	micVol  float64 // 0..2
-	spkVol  float64 // 0..2
-	micMute bool
+	// Состояние устройств — только под e.mu; колбэки e.mu не берут.
+	mu       sync.Mutex
+	capDev   *malgo.Device
+	playDev  *malgo.Device
+	capName  string // запущенное устройство захвата (для пропуска лишних рестартов)
+	playName string
+	capList  []Device
+	playList []Device
+
+	micVol  atomic.Uint64 // биты float64, 0..2
+	spkVol  atomic.Uint64
+	micMute atomic.Bool
 
 	micRing  *ring // захват -> сеть
 	jitRing  *ring // сеть -> воспроизведение (джиттер-буфер)
-	starving bool
+	starving bool  // только из playback-колбэка (один поток)
 	scratch  []int16
-
-	capDev   *malgo.Device
-	playDev  *malgo.Device
-	capList  []Device
-	playList []Device
 }
 
 func NewEngine() (*Engine, error) {
@@ -62,14 +73,15 @@ func NewEngine() (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{
+	e := &Engine{
 		ctx:     ctx,
 		micRing: newRing(captureRingCap),
 		jitRing: newRing(jitterRingCap),
 		scratch: make([]int16, FrameSamples*4),
-		micVol:  1,
-		spkVol:  1,
-	}, nil
+	}
+	e.SetMicVolume(1)
+	e.SetSpkVolume(1)
+	return e, nil
 }
 
 // Close stops devices and releases the audio context.
@@ -99,33 +111,50 @@ func (e *Engine) Devices(kind DeviceKind) ([]Device, error) {
 			id: unsafe.Pointer(&infos[i].ID),
 		})
 	}
+
+	e.mu.Lock()
 	if kind == KindCapture {
 		e.capList = list
 	} else {
 		e.playList = list
 	}
-	return list, nil
+	e.mu.Unlock()
+	return append([]Device(nil), list...), nil
 }
 
 // UseCaptureByName switches the microphone. Empty name = default device.
+// Переключение пропускается, если это устройство уже запущено.
 func (e *Engine) UseCaptureByName(name string) error {
-	id, err := e.findID(e.capList, name)
+	e.mu.Lock()
+	if name == e.capName && e.capDev != nil {
+		e.mu.Unlock()
+		return nil
+	}
+	id, err := e.findIDLocked(e.capList, name)
+	e.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return e.StartCapture(id)
+	return e.StartCapture(id, name)
 }
 
 // UsePlaybackByName switches the output device. Empty name = default.
 func (e *Engine) UsePlaybackByName(name string) error {
-	id, err := e.findID(e.playList, name)
+	e.mu.Lock()
+	if name == e.playName && e.playDev != nil {
+		e.mu.Unlock()
+		return nil
+	}
+	id, err := e.findIDLocked(e.playList, name)
+	e.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return e.StartPlayback(id)
+	return e.StartPlayback(id, name)
 }
 
-func (e *Engine) findID(list []Device, name string) (unsafe.Pointer, error) {
+// findIDLocked ищет устройство в списке; зовётся под e.mu.
+func (e *Engine) findIDLocked(list []Device, name string) (unsafe.Pointer, error) {
 	for i := range list {
 		if list[i].Name == name {
 			return list[i].id, nil
@@ -144,7 +173,7 @@ func (e *Engine) findID(list []Device, name string) (unsafe.Pointer, error) {
 }
 
 // StartCapture opens the microphone (nil id = default device).
-func (e *Engine) StartCapture(deviceID unsafe.Pointer) error {
+func (e *Engine) StartCapture(deviceID unsafe.Pointer, name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -169,11 +198,12 @@ func (e *Engine) StartCapture(deviceID unsafe.Pointer) error {
 		return err
 	}
 	e.capDev = dev
+	e.capName = name
 	return nil
 }
 
 // StartPlayback opens the output device (nil id = default device).
-func (e *Engine) StartPlayback(deviceID unsafe.Pointer) error {
+func (e *Engine) StartPlayback(deviceID unsafe.Pointer, name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -198,6 +228,7 @@ func (e *Engine) StartPlayback(deviceID unsafe.Pointer) error {
 		return err
 	}
 	e.playDev = dev
+	e.playName = name
 	return nil
 }
 
@@ -213,6 +244,16 @@ func (e *Engine) StopDevices() {
 		e.playDev.Uninit()
 		e.playDev = nil
 	}
+	e.capName = ""
+	e.playName = ""
+}
+
+// ResetBuffers выбрасывает накопленное (вызывается при установке связи,
+// чтобы другу не улетела минута «старого» микрофона из-за разрыва).
+func (e *Engine) ResetBuffers() {
+	e.micRing.reset()
+	e.jitRing.reset()
+	e.starving = true
 }
 
 // WriteReceived pushes a decoded frame into the jitter buffer.
@@ -231,9 +272,8 @@ func (e *Engine) ReadMicFrame(dst []int16) bool {
 		return false
 	}
 
-	e.mu.Lock()
-	mute, vol := e.micMute, e.micVol
-	e.mu.Unlock()
+	mute := e.micMute.Load()
+	vol := math.Float64frombits(e.micVol.Load())
 
 	if mute || vol == 0 {
 		for i := 0; i < FrameSamples; i++ {
@@ -249,9 +289,9 @@ func (e *Engine) ReadMicFrame(dst []int16) bool {
 	return true
 }
 
-func (e *Engine) SetMicVolume(v float64)  { e.mu.Lock(); e.micVol = clampVol(v); e.mu.Unlock() }
-func (e *Engine) SetSpkVolume(v float64)  { e.mu.Lock(); e.spkVol = clampVol(v); e.mu.Unlock() }
-func (e *Engine) SetMicMuted(muted bool)  { e.mu.Lock(); e.micMute = muted; e.mu.Unlock() }
+func (e *Engine) SetMicVolume(v float64) { e.micVol.Store(math.Float64bits(clampVol(v))) }
+func (e *Engine) SetSpkVolume(v float64) { e.spkVol.Store(math.Float64bits(clampVol(v))) }
+func (e *Engine) SetMicMuted(muted bool) { e.micMute.Store(muted) }
 
 // onCaptureData runs on the device thread: copy mic bytes into the ring.
 func (e *Engine) onCaptureData(_, input []byte, _ uint32) {
@@ -268,18 +308,15 @@ func (e *Engine) onCaptureData(_, input []byte, _ uint32) {
 
 // onPlaybackData runs on the device thread: pull from the jitter buffer,
 // apply volume; on underrun output silence and wait for the prebuffer.
+// Никаких мьютексов здесь — только атомики и кольца.
 func (e *Engine) onPlaybackData(output, _ []byte, _ uint32) {
-	for i := range output {
-		output[i] = 0
-	}
+	clear(output)
 	need := len(output) / 2
 	if need == 0 {
 		return
 	}
 
-	e.mu.Lock()
-	vol := e.spkVol
-	e.mu.Unlock()
+	vol := math.Float64frombits(e.spkVol.Load())
 
 	if e.starving {
 		if e.jitRing.available() < jitterPrebuffer {
@@ -288,9 +325,16 @@ func (e *Engine) onPlaybackData(output, _ []byte, _ uint32) {
 		e.starving = false
 	}
 
-	n := e.jitRing.read(e.scratch[:need])
+	n := need
+	if n > len(e.scratch) {
+		n = len(e.scratch) // защита от бэкенда с неожиданно крупным периодом
+	}
+	n = e.jitRing.read(e.scratch[:n])
 	if n < need {
 		e.starving = true // недобор — выдаём тишину, копим предбуфер
+	}
+	if vol == 0 {
+		return
 	}
 	for i := 0; i < n; i++ {
 		v := clampSample(int(float64(e.scratch[i]) * vol))
