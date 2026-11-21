@@ -13,6 +13,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/Jagyar/voice2us/internal/audio"
@@ -27,10 +28,11 @@ type appState struct {
 
 	engine *audio.Engine
 
-	conn    *net.UDPConn
-	myCode  *proto.Code
-	session *proto.Session
-	cancel  context.CancelFunc
+	conn     *net.UDPConn
+	myCode   *proto.Code
+	session  *proto.Session
+	peerCode *proto.Code // код друга текущей сессии
+	cancel   context.CancelFunc
 
 	reasonMu        sync.Mutex // защищает stopReason: пишут и pump, и UI-поток
 	stopReason      string
@@ -43,6 +45,9 @@ type appState struct {
 	createBtn     *widget.Button
 	connectBtn    *widget.Button
 	statusLabel   *widget.Label
+	friendBox     *fyne.Container
+	friendLabel   *widget.Label
+	callFriendBtn *widget.Button
 
 	// экран разговора
 	peerLabel  *widget.Label
@@ -54,7 +59,9 @@ type appState struct {
 	spkSlider  *widget.Slider
 	micPct     *widget.Label
 	spkPct     *widget.Label
-	micMute    *widget.Check
+	muteBtn    *widget.Button
+	refreshBtn *widget.Button
+	muted      bool
 	hangupBtn  *widget.Button
 
 	root       *fyne.Container // стек: главный экран + экран разговора
@@ -108,7 +115,22 @@ func (s *appState) buildUI() {
 	s.statusLabel = widget.NewLabel("")
 	s.statusLabel.Wrapping = fyne.TextWrapWord
 
+	s.friendLabel = widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	s.callFriendBtn = widget.NewButtonWithIcon("Позвонить", theme.MediaPlayIcon(), s.onCallFriend)
+	s.callFriendBtn.Importance = widget.HighImportance
+	forgetBtn := widget.NewButton("Забыть друга", func() {
+		s.forgetFriend()
+		s.refreshFriendBox()
+	})
+	s.friendBox = container.NewVBox(
+		s.friendLabel,
+		widget.NewLabel("Без обмена кодами: друг тоже должен нажать «Позвонить» (примерно в одно время)."),
+		container.NewGridWithColumns(2, s.callFriendBtn, forgetBtn),
+		widget.NewSeparator(),
+	)
+
 	s.mainScreen = container.NewVBox(
+		s.friendBox,
 		widget.NewLabel("Ваше имя:"),
 		s.nameEntry,
 		widget.NewSeparator(),
@@ -170,11 +192,10 @@ func (s *appState) buildUI() {
 		s.prefs.SetFloat("spkVol", v)
 	}
 
-	s.micMute = widget.NewCheck("Выключить микрофон (mute)", func(v bool) {
-		if s.engine != nil {
-			s.engine.SetMicMuted(v)
-		}
+	s.muteBtn = widget.NewButtonWithIcon("Микрофон включён — нажмите, чтобы выключить", theme.VolumeUpIcon(), func() {
+		s.setMuted(!s.muted)
 	})
+	s.refreshBtn = widget.NewButtonWithIcon("Обновить список устройств", theme.ViewRefreshIcon(), s.refreshDevices)
 
 	s.hangupBtn = widget.NewButton("Завершить разговор", s.hangup)
 
@@ -182,14 +203,15 @@ func (s *appState) buildUI() {
 		s.peerLabel,
 		s.callStatus,
 		s.rttLabel,
+		s.muteBtn,
 		widget.NewSeparator(),
 		widget.NewLabel("Микрофон:"),
 		s.micSelect,
-		container.NewHBox(s.micSlider, s.micPct),
-		s.micMute,
+		container.NewBorder(nil, nil, nil, s.micPct, s.micSlider),
 		widget.NewLabel("Динамик / наушники:"),
 		s.spkSelect,
-		container.NewHBox(s.spkSlider, s.spkPct),
+		container.NewBorder(nil, nil, nil, s.spkPct, s.spkSlider),
+		s.refreshBtn,
 		widget.NewSeparator(),
 		s.hangupBtn,
 	)
@@ -205,6 +227,7 @@ func (s *appState) buildUI() {
 }
 
 func (s *appState) loadPrefs() {
+	s.refreshFriendBox()
 	s.nameEntry.SetText(s.prefs.String("name"))
 	micVol := s.prefs.FloatWithFallback("micVol", 100)
 	spkVol := s.prefs.FloatWithFallback("spkVol", 100)
@@ -223,6 +246,60 @@ func (s *appState) loadPrefs() {
 
 // --- главный экран ---
 
+func (s *appState) refreshFriendBox() {
+	if f := s.loadFriend(); f != nil {
+		s.friendLabel.SetText("Друг: " + f.Name)
+		s.friendBox.Show()
+	} else {
+		s.friendBox.Hide()
+	}
+}
+
+func (s *appState) setMuted(m bool) {
+	s.muted = m
+	if s.engine != nil {
+		s.engine.SetMicMuted(m)
+	}
+	if m {
+		s.muteBtn.SetText("Микрофон ВЫКЛЮЧЕН — нажмите, чтобы включить")
+		s.muteBtn.SetIcon(theme.VolumeMuteIcon())
+		s.muteBtn.Importance = widget.DangerImportance
+	} else {
+		s.muteBtn.SetText("Микрофон включён — нажмите, чтобы выключить")
+		s.muteBtn.SetIcon(theme.VolumeUpIcon())
+		s.muteBtn.Importance = widget.MediumImportance
+	}
+	s.muteBtn.Refresh()
+}
+
+// onCallFriend — повторное подключение к сохранённому другу без обмена кодами.
+func (s *appState) onCallFriend() {
+	if s.engine == nil {
+		s.setStatus("Аудио недоступно: не удалось инициализировать звуковой subsystem.")
+		return
+	}
+	f := s.loadFriend()
+	if f == nil {
+		s.refreshFriendBox()
+		return
+	}
+	if s.conn == nil {
+		conn, err := listenUDP(s.prefs.Int(prefUDPPort))
+		if err != nil {
+			s.setStatus("Не удалось открыть UDP-порт: " + err.Error())
+			return
+		}
+		s.conn = conn
+	}
+	name := s.nameEntry.Text
+	if name == "" {
+		name = "Без имени"
+	}
+	our, peer := f.codes(name)
+	s.myCode = our
+	s.startSession(peer, true)
+}
+
 func (s *appState) onCreateCode() {
 	if s.engine == nil {
 		s.setStatus("Аудио недоступно: не удалось инициализировать звуковой subsystem.")
@@ -233,10 +310,10 @@ func (s *appState) onCreateCode() {
 	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
 	name := s.nameEntry.Text
-	have, haveConn := s.myCode, s.conn // снимок: фоновая горутина UI-состояние не трогает
+	have, haveConn, port := s.myCode, s.conn, s.prefs.Int(prefUDPPort) // снимок: фоновая горутина UI-состояние не трогает
 
 	go func() {
-		conn, code, warn, err := s.prepareCode(have, haveConn, proto.RoleA, name)
+		conn, code, warn, err := s.prepareCode(have, haveConn, port, proto.RoleA, name)
 		fyne.Do(func() {
 			s.applyCode(conn, code)
 			s.createBtn.Enable()
@@ -279,10 +356,10 @@ func (s *appState) onPeerCode() {
 	s.connectBtn.Disable()
 	s.setStatus("Определяем адреса (STUN)…")
 	name := s.nameEntry.Text
-	have, haveConn := s.myCode, s.conn // снимок: фоновая горутина UI-состояние не трогает
+	have, haveConn, port := s.myCode, s.conn, s.prefs.Int(prefUDPPort) // снимок: фоновая горутина UI-состояние не трогает
 
 	go func() {
-		conn, code, warn, err := s.prepareCode(have, haveConn, proto.Opposite(peer.Role), name)
+		conn, code, warn, err := s.prepareCode(have, haveConn, port, proto.Opposite(peer.Role), name)
 		fyne.Do(func() {
 			s.applyCode(conn, code)
 			s.createBtn.Enable()
@@ -293,7 +370,7 @@ func (s *appState) onPeerCode() {
 			}
 			codeStr, _ := proto.MarshalCode(s.myCode)
 			s.myCodeEntry.SetText(codeStr)
-			s.startSession(peer)
+			s.startSession(peer, false)
 			if warn != "" {
 				s.setStatus(s.statusLabel.Text + " " + warn)
 			}
@@ -305,13 +382,13 @@ func (s *appState) onPeerCode() {
 // состояние UI: возвращает результат, который applyCode применит на
 // главном потоке. have/haveConn — снимок текущих значений.
 // Возвращает предупреждение (пусто, если всё хорошо) и ошибку.
-func (s *appState) prepareCode(have *proto.Code, haveConn *net.UDPConn, role proto.Role, name string) (*net.UDPConn, *proto.Code, string, error) {
+func (s *appState) prepareCode(have *proto.Code, haveConn *net.UDPConn, port int, role proto.Role, name string) (*net.UDPConn, *proto.Code, string, error) {
 	if have != nil && have.Role == role {
 		return haveConn, have, "", nil
 	}
 	conn := haveConn
 	if conn == nil {
-		c, err := net.ListenUDP("udp4", nil)
+		c, err := listenUDP(port)
 		if err != nil {
 			return nil, nil, "", fmt.Errorf("не удалось открыть UDP-порт: %w", err)
 		}
@@ -355,7 +432,7 @@ func (s *appState) applyCode(conn *net.UDPConn, code *proto.Code) {
 	}
 }
 
-func (s *appState) startSession(peer *proto.Code) {
+func (s *appState) startSession(peer *proto.Code, waitFriend bool) {
 	if s.session != nil {
 		s.setStatus("Разговор уже идёт — сначала завершите его.")
 		return
@@ -369,10 +446,13 @@ func (s *appState) startSession(peer *proto.Code) {
 
 	s.setReason("")
 	s.session = sess
+	s.peerCode = peer
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
-	if s.myCode.Role == proto.RoleB {
+	if waitFriend {
+		s.setStatus("Ждём друга: он тоже должен нажать «Позвонить»…")
+	} else if s.myCode.Role == proto.RoleB {
 		s.setStatus("Ответный код показан выше — отправьте его другу. Ищем связь…")
 	} else {
 		s.setStatus("Соединяемся…")
@@ -381,6 +461,7 @@ func (s *appState) startSession(peer *proto.Code) {
 	go sess.Run(ctx)
 	go s.pump(sess, ctx)
 	go s.micPuller(sess, ctx.Done())
+	go s.watchDevices(ctx.Done())
 }
 
 // pump перекладывает события сессии в интерфейс, а входящие кадры — в звук.
@@ -395,7 +476,10 @@ func (s *appState) pump(sess *proto.Session, ctx context.Context) {
 				if s.engine != nil {
 					s.engine.ResetBuffers() // выкинуть накопленное за время разрыва
 				}
-				fyne.Do(func() { s.showCall(ev.Peer) })
+				fyne.Do(func() {
+					s.rememberFriendNow(ev.Remote)
+					s.showCall(ev.Peer)
+				})
 			case proto.EvLost:
 				fyne.Do(func() {
 					s.callStatus.SetText("Связь прервалась — переподключаемся…")
@@ -447,6 +531,51 @@ func (s *appState) micPuller(sess *proto.Session, done <-chan struct{}) {
 }
 
 // --- экран разговора ---
+
+// rememberFriendNow (UI-поток) сохраняет друга и порт нашего сокета.
+func (s *appState) rememberFriendNow(remote string) {
+	if s.myCode == nil || s.peerCode == nil {
+		return
+	}
+	s.saveFriend(rememberConnection(s.myCode, s.peerCode, remote))
+	if s.conn != nil {
+		s.prefs.SetInt(prefUDPPort, s.conn.LocalAddr().(*net.UDPAddr).Port)
+	}
+	s.refreshFriendBox()
+}
+
+// watchDevices раз в пару секунд проверяет, не подключили ли наушники
+// или не отключили ли устройство, и обновляет списки в интерфейсе.
+func (s *appState) watchDevices(done <-chan struct{}) {
+	if s.engine == nil {
+		return
+	}
+	snapshot := func() string {
+		var out string
+		for _, k := range []audio.DeviceKind{audio.KindCapture, audio.KindPlayback} {
+			list, _ := s.engine.Devices(k)
+			out += fmt.Sprint(k) + ":"
+			for _, d := range list {
+				out += d.Name + "|"
+			}
+		}
+		return out
+	}
+	last := snapshot()
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			if cur := snapshot(); cur != last {
+				last = cur
+				fyne.Do(s.refreshDevices)
+			}
+		}
+	}
+}
 
 func (s *appState) showCall(peerName string) {
 	s.peerLabel.SetText("Разговор с " + peerName)
@@ -544,6 +673,8 @@ func (s *appState) finishCall(reason string) {
 		s.engine.StopDevices()
 	}
 	s.session = nil
+	s.peerCode = nil
+	s.setMuted(false)
 	s.myCode = nil // новый разговор — новый ключ сессии и свежие адреса
 	if reason == "" {
 		reason = "Отключено."

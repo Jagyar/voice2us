@@ -59,3 +59,27 @@ func TestWrongDirectionRejected(t *testing.T) {
 		t.Fatal("свой же пакет не должен приниматься")
 	}
 }
+
+// Один и тот же ключ в разных сессиях (сохранённый друг): у каждой сессии
+// своя эпоха и свои ключи, а старая эпоха после потери связи не мешает новой.
+func TestSharedKeyAcrossSessions(t *testing.T) {
+	a1, b := pair(t)
+	k := bytes.Repeat([]byte{9}, 32)
+	a2, _ := NewCrypto(k, RoleA) // перезапущенный A, seq снова с нуля
+
+	p1 := a1.Seal(nil, []byte("x"), 0, PktAudio)
+	p2 := a2.Seal(nil, []byte("x"), 0, PktAudio)
+	if bytes.Equal(p1[wireEpochBytes+wireSeqBytes:], p2[wireEpochBytes+wireSeqBytes:]) {
+		t.Fatal("одинаковый шифротекст при одинаковом seq: ключи сессий совпали")
+	}
+	if _, _, err := b.Open(p1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.Open(p2); err == nil {
+		t.Fatal("чужая эпоха должна отвергаться, пока связь жива")
+	}
+	b.ResetPeer()
+	if _, _, err := b.Open(p2); err != nil {
+		t.Fatalf("после ResetPeer новая сессия друга должна приниматься: %v", err)
+	}
+}

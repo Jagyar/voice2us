@@ -20,7 +20,7 @@ func main() {
 
 	a := app.NewWithID("ru.jagyar.voice2us")
 	w := a.NewWindow("Voice2Us")
-	w.Resize(fyne.NewSize(480, 620))
+	w.Resize(fyne.NewSize(480, 720))
 
 	s := newAppState(a, w)
 	s.buildUI()

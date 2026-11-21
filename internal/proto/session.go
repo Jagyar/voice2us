@@ -33,6 +33,7 @@ const (
 type Event struct {
 	Kind   EventKind
 	Peer   string
+	Remote string // для EvConnected: адрес, с которого ответил друг
 	RTTms  int64
 	Reason string
 }
@@ -232,7 +233,7 @@ func (s *Session) recvLoop() {
 		if !s.connected.Load() {
 			s.remote.Store(src)
 			s.connected.Store(true)
-			s.emit(Event{Kind: EvConnected, Peer: s.peer.Name})
+			s.emit(Event{Kind: EvConnected, Peer: s.peer.Name, Remote: src.String()})
 		} else if cur := s.remote.Load(); cur != nil && !sameAddr(cur, src) {
 			// Друг виден через ещё один путь (LAN vs интернет): запоминаем
 			// как запасной, но основной не меняем без причины.
@@ -306,6 +307,7 @@ func (s *Session) sendLoop(ctx context.Context) {
 			if silence > connectedTimeout.Milliseconds() {
 				s.connected.Store(false)
 				s.alt.Store(nil)
+				s.cr.ResetPeer() // друг мог перезапуститься — примем его новую эпоху
 				blastSince = now
 				stallEmitted = false
 				s.emit(Event{Kind: EvLost, Reason: "связь прервалась"})
