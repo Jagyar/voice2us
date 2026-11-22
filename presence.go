@@ -25,16 +25,13 @@ const (
 	stDeclined  = "declined"
 	stInCall    = "incall"
 
-	putSlow     = 15 * time.Second // heartbeat в покое
-	putFast     = 4 * time.Second  // во время вызова
-	getSlow     = 3 * time.Second
-	getFast     = 1 * time.Second // пока ждём ответа на свой вызов
-	downRetry   = 10 * time.Second
-	ringFresh   = 12 * time.Second // входящий вызов старше — считаем мёртвым
+	putSlow   = 15 * time.Second // heartbeat в покое
+	putFast   = 4 * time.Second  // во время вызова
+	getSlow   = 3 * time.Second
+	getFast   = 1 * time.Second // пока ждём ответа на свой вызов
+	downRetry = 10 * time.Second
+	ringFresh = 12 * time.Second // входящий вызов старше — считаем мёртвым
 )
-
-// healthEvery — как часто проверять сервер независимо от друзей (в тестах короче).
-var healthEvery = 20 * time.Second
 
 type peerStatus struct {
 	Online bool
@@ -63,18 +60,19 @@ type presenceBlob struct {
 }
 
 type presence struct {
-	mu         sync.Mutex
-	client     *rdv.Client
-	friends    []*friend
-	name       string
-	own        map[string]ownState
-	busy       bool
-	lastPut    map[string]time.Time
-	lastGet    map[string]time.Time
-	last       map[string]peerStatus
-	down       time.Time // до этого момента сервер не трогаем
-	serverOK   *bool
-	lastHealth time.Time
+	mu          sync.Mutex
+	client      *rdv.Client
+	friends     []*friend
+	name        string
+	own         map[string]ownState
+	busy        bool
+	lastPut     map[string]time.Time
+	lastGet     map[string]time.Time
+	last        map[string]peerStatus
+	down        time.Time // до этого момента сервер не трогаем
+	serverOK    *bool
+	lastHealth  time.Time
+	healthEvery time.Duration // как часто проверять сервер независимо от друзей
 
 	onUpdate func(id string, st peerStatus) // из горутины presence
 	onServer func(ok bool)
@@ -85,12 +83,13 @@ type presence struct {
 
 func newPresence() *presence {
 	return &presence{
-		own:     map[string]ownState{},
-		lastPut: map[string]time.Time{},
-		lastGet: map[string]time.Time{},
-		last:    map[string]peerStatus{},
-		wake:    make(chan struct{}, 1),
-		stop:    make(chan struct{}),
+		healthEvery: 20 * time.Second,
+		own:         map[string]ownState{},
+		lastPut:     map[string]time.Time{},
+		lastGet:     map[string]time.Time{},
+		last:        map[string]peerStatus{},
+		wake:        make(chan struct{}, 1),
+		stop:        make(chan struct{}),
 	}
 }
 
@@ -193,7 +192,7 @@ func (p *presence) tick() {
 	friends := append([]*friend(nil), p.friends...)
 	now := time.Now()
 	down := now.Before(p.down)
-	every := healthEvery
+	every := p.healthEvery
 	if p.serverOK != nil && !*p.serverOK {
 		every = downRetry
 	}

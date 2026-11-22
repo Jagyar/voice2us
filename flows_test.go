@@ -222,11 +222,9 @@ func TestFriendMigrationAndID(t *testing.T) {
 // У пользователя без друзей состояние сервера всё равно должно определиться
 // (раньше в подвале навсегда оставалось «проверяем…»).
 func TestServerStateWithoutFriends(t *testing.T) {
-	old := healthEvery
-	healthEvery = time.Second
-	defer func() { healthEvery = old }()
 	ts := httptest.NewServer(rdv.NewServer().Handler())
 	p := newPresence()
+	p.healthEvery = time.Second
 	got := make(chan bool, 4)
 	p.onServer = func(ok bool) { got <- ok }
 	p.SetClient(rdv.NewClient(ts.URL))
