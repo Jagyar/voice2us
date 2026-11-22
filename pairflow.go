@@ -31,6 +31,10 @@ const (
 // --- приглашающий ---
 
 func (s *appState) onInvite() {
+	if s.engine == nil {
+		s.setStatus("Аудио недоступно: не удалось инициализировать звуковую систему.")
+		return
+	}
 	if s.phase != phaseIdle || !s.acquireSock() {
 		s.setStatus("Сейчас идёт другое соединение — подождите.")
 		return
@@ -180,6 +184,10 @@ func (s *appState) runInvite(ctx context.Context, c *rdv.Client, phrase string, 
 // --- принимающий ---
 
 func (s *appState) onJoin() {
+	if s.engine == nil {
+		s.setStatus("Аудио недоступно: не удалось инициализировать звуковую систему.")
+		return
+	}
 	if s.phase != phaseIdle || !s.acquireSock() {
 		s.setStatus("Сейчас идёт другое соединение — подождите.")
 		return

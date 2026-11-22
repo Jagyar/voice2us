@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./internal/proto ./internal/stun ./internal/rdv
+      - run: go test -count=1 ./...
       - name: Build .dmg
         run: VERSION="${GITHUB_REF_NAME#v}" ./build.sh mac
       - run: mv dist/Voice2Us.dmg "dist/Voice2Us-${GITHUB_REF_NAME}-macOS.dmg"

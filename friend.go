@@ -88,17 +88,18 @@ func (s *appState) findFriend(id string) *friend {
 
 // upsertFriend добавляет друга или обновляет адреса уже известного
 // (имя, которое пользователь мог поменять, при этом не затирается).
-func (s *appState) upsertFriend(nf *friend) {
+func (s *appState) upsertFriend(nf *friend) bool {
 	if old := s.findFriend(nf.ID); old != nil {
 		old.Peer = nf.Peer
 		s.saveFriends(s.friends)
-		return
+		return true
 	}
 	if len(s.friends) >= maxFriends {
-		return
+		return false
 	}
 	s.friends = append(s.friends, nf)
 	s.saveFriends(s.friends)
+	return true
 }
 
 func (s *appState) removeFriend(id string) {

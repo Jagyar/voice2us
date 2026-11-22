@@ -11,16 +11,20 @@ import (
 )
 
 const (
-	PairTTL      = 10 * time.Minute // жизнь слота приглашения
-	FriendTTL    = 45 * time.Second // сколько живёт блок статуса без обновления
-	MaxBlob      = 4096
-	maxEntries   = 50000
-	ratePerSec   = 40.0
-	rateBurst    = 120.0
-	sweepEvery   = 10 * time.Second
-	bucketIdle   = 5 * time.Minute
-	maxBuckets   = 100000
-	healthString = "ok\n"
+	PairTTL       = 10 * time.Minute // жизнь слота приглашения
+	FriendTTL     = 45 * time.Second // сколько живёт блок статуса без обновления
+	MaxBlob       = 4096             // блок приглашения (код с адресами)
+	MaxFriendBlob = 1024             // блок статуса: реально ~300 байт
+	maxPairs      = 10000
+	maxFriends    = 10000
+	perIPPairs    = 20  // приглашений с одного IP одновременно
+	perIPFriends  = 100 // блоков статуса с одного IP одновременно
+	ratePerSec    = 40.0
+	rateBurst     = 120.0
+	sweepEvery    = 10 * time.Second
+	bucketIdle    = 5 * time.Minute
+	maxBuckets    = 100000
+	healthString  = "ok\n"
 )
 
 var (
@@ -32,6 +36,8 @@ type entry struct {
 	blob    []byte
 	created time.Time
 	expires time.Time
+	owner   string // ключ клиента (IP или /64), для квот
+	friend  bool
 }
 
 type bucket struct {
@@ -47,10 +53,12 @@ type Server struct {
 	mu      sync.Mutex
 	m       map[string]*entry
 	buckets map[string]*bucket
+	counts  map[string]*[2]int // по владельцу: [приглашения, статусы]
+	total   [2]int
 }
 
 func NewServer() *Server {
-	return &Server{now: time.Now, m: map[string]*entry{}, buckets: map[string]*bucket{}}
+	return &Server{now: time.Now, m: map[string]*entry{}, buckets: map[string]*bucket{}, counts: map[string]*[2]int{}}
 }
 
 // Run запускает фоновую очистку до закрытия done.
@@ -74,7 +82,7 @@ func (s *Server) Sweep() {
 	defer s.mu.Unlock()
 	for k, e := range s.m {
 		if now.After(e.expires) {
-			delete(s.m, k)
+			s.remove(k)
 		}
 	}
 	for ip, b := range s.buckets {
@@ -97,24 +105,41 @@ func (s *Server) Handler() http.Handler {
 	return s.limit(mux)
 }
 
-// limit — ограничение частоты запросов с одного IP (token bucket).
+// clientKey: IPv4 — как есть, IPv6 — по префиксу /64 (иначе одна сеть
+// плодила бы бесконечно много «разных» клиентов).
+func clientKey(remote string) string {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String()
+}
+
+// limit — ограничение частоты запросов с одного клиента (token bucket).
 func (s *Server) limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
-		}
+		key := clientKey(r.RemoteAddr)
 		now := s.now()
 		s.mu.Lock()
-		b := s.buckets[ip]
+		b := s.buckets[key]
 		if b == nil {
 			if len(s.buckets) >= maxBuckets {
-				s.mu.Unlock()
-				http.Error(w, "busy", http.StatusServiceUnavailable)
-				return
+				// Не отказываем новым клиентам: вытесняем одну произвольную
+				// корзину (порядок обхода map случаен).
+				for k := range s.buckets {
+					delete(s.buckets, k)
+					break
+				}
 			}
 			b = &bucket{tokens: rateBurst, last: now}
-			s.buckets[ip] = b
+			s.buckets[key] = b
 		}
 		b.tokens += now.Sub(b.last).Seconds() * ratePerSec
 		if b.tokens > rateBurst {
@@ -135,10 +160,53 @@ func (s *Server) limit(next http.Handler) http.Handler {
 	})
 }
 
+// remove удаляет запись и снимает её с квот (вызывать под s.mu).
+func (s *Server) remove(key string) {
+	e, ok := s.m[key]
+	if !ok {
+		return
+	}
+	delete(s.m, key)
+	kind := 0
+	if e.friend {
+		kind = 1
+	}
+	s.total[kind]--
+	if c := s.counts[e.owner]; c != nil {
+		c[kind]--
+		if c[0] <= 0 && c[1] <= 0 {
+			delete(s.counts, e.owner)
+		}
+	}
+}
+
+// add сохраняет запись с учётом квот (под s.mu). false — квота исчерпана.
+func (s *Server) add(key string, e *entry) bool {
+	kind, perIP, global := 0, perIPPairs, maxPairs
+	if e.friend {
+		kind, perIP, global = 1, perIPFriends, maxFriends
+	}
+	if _, exists := s.m[key]; exists {
+		s.remove(key) // перезапись (heartbeat): сначала снимаем старую
+	}
+	c := s.counts[e.owner]
+	if s.total[kind] >= global || (c != nil && c[kind] >= perIP) {
+		return false
+	}
+	if c == nil {
+		c = &[2]int{}
+		s.counts[e.owner] = c
+	}
+	c[kind]++
+	s.total[kind]++
+	s.m[key] = e
+	return true
+}
+
 func validSide(v string) bool { return v == "a" || v == "b" }
 
-func readBlob(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBlob))
+func readBlob(w http.ResponseWriter, r *http.Request, max int64) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, max))
 	if err != nil || len(body) == 0 {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return nil, false
@@ -150,7 +218,7 @@ func (s *Server) get(key string) (*entry, bool) {
 	e, ok := s.m[key]
 	if !ok || s.now().After(e.expires) {
 		if ok {
-			delete(s.m, key)
+			s.remove(key)
 		}
 		return nil, false
 	}
@@ -172,11 +240,12 @@ func (s *Server) putPair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	body, ok := readBlob(w, r)
+	body, ok := readBlob(w, r, MaxBlob)
 	if !ok {
 		return
 	}
 	now := s.now()
+	owner := clientKey(r.RemoteAddr)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,11 +262,10 @@ func (s *Server) putPair(w http.ResponseWriter, r *http.Request) {
 		}
 		exp = a.expires // ответ живёт не дольше самого приглашения
 	}
-	if len(s.m) >= maxEntries {
-		http.Error(w, "busy", http.StatusServiceUnavailable)
+	if !s.add("p/"+slot+"/"+side, &entry{blob: body, created: now, expires: exp, owner: owner}) {
+		http.Error(w, "quota", http.StatusServiceUnavailable)
 		return
 	}
-	s.m["p/"+slot+"/"+side] = &entry{blob: body, created: now, expires: exp}
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -224,8 +292,8 @@ func (s *Server) deletePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	delete(s.m, "p/"+slot+"/a")
-	delete(s.m, "p/"+slot+"/b")
+	s.remove("p/" + slot + "/a")
+	s.remove("p/" + slot + "/b")
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -238,7 +306,7 @@ func (s *Server) putFriend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	body, ok := readBlob(w, r)
+	body, ok := readBlob(w, r, MaxFriendBlob)
 	if !ok {
 		return
 	}
@@ -247,11 +315,10 @@ func (s *Server) putFriend(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.m[key]; !exists && len(s.m) >= maxEntries {
-		http.Error(w, "busy", http.StatusServiceUnavailable)
+	if !s.add(key, &entry{blob: body, created: now, expires: now.Add(FriendTTL), owner: clientKey(r.RemoteAddr), friend: true}) {
+		http.Error(w, "quota", http.StatusServiceUnavailable)
 		return
 	}
-	s.m[key] = &entry{blob: body, created: now, expires: now.Add(FriendTTL)}
 	w.WriteHeader(http.StatusNoContent)
 }
 

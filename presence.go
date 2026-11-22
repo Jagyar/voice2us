@@ -40,7 +40,8 @@ type peerStatus struct {
 	Name   string
 	EP     proto.Endpoints
 	Age    time.Duration
-	Err    bool // сервер недоступен: статус неизвестен
+	Seen   time.Time // когда получен ответ сервера (возраст = Age + прошедшее с Seen)
+	Err    bool      // сервер недоступен: статус неизвестен
 }
 
 type ownState struct {
@@ -276,11 +277,13 @@ func (p *presence) get(c *rdv.Client, f *friend) {
 		}
 	}
 
+	st.Seen = time.Now()
 	p.mu.Lock()
 	prev, had := p.last[f.ID]
 	// Возраст меняется постоянно — не повод обновлять интерфейс.
 	pc, sc := prev, st
 	pc.Age, sc.Age = 0, 0
+	pc.Seen, sc.Seen = time.Time{}, time.Time{}
 	changed := !had || !reflect.DeepEqual(pc, sc)
 	p.last[f.ID] = st
 	cb := p.onUpdate

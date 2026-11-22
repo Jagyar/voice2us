@@ -77,3 +77,37 @@ func TestUpdateBanner(t *testing.T) {
 		t.Fatal("актуальная версия — плашка скрыта")
 	}
 }
+
+// Ошибка запуска сессии не должна оставлять интерфейс в «занято» навсегда.
+func TestFailedStartReturnsToIdle(t *testing.T) {
+	a := test.NewApp()
+	w := a.NewWindow("Voice2Us")
+	s := newAppState(a, w)
+	s.buildUI()
+	s.engine = nil
+	s.friends = []*friend{{ID: "1", Name: "Аня"}}
+	s.phase = phaseCalling
+	s.callFriend = s.friends[0]
+	s.startSession(nil, false)
+	if s.phase != phaseIdle || s.callFriend != nil {
+		t.Fatalf("после ошибки старта должен быть phaseIdle, а не %v", s.phase)
+	}
+	if s.statusLabel.Text == "" {
+		t.Fatal("пользователь должен увидеть причину")
+	}
+}
+
+func TestConnectingStrip(t *testing.T) {
+	a := test.NewApp()
+	w := a.NewWindow("Voice2Us")
+	s := newAppState(a, w)
+	s.buildUI()
+	s.showConnecting("Соединяемся…")
+	if len(s.connectBox.Objects) != 1 {
+		t.Fatal("плашка «Соединяемся… Отмена» должна появиться")
+	}
+	s.hideConnecting()
+	if len(s.connectBox.Objects) != 0 {
+		t.Fatal("плашка должна исчезнуть")
+	}
+}

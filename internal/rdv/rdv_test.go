@@ -246,3 +246,96 @@ func TestClientNoBase(t *testing.T) {
 		t.Fatal("пустой адрес — ошибка")
 	}
 }
+
+func TestQuotasPerIPAndRelease(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	srv := NewServer()
+	srv.now = clk.Now
+	h := srv.Handler()
+	put := func(ip, path string, n int) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("PUT", path, bytes.NewReader(make([]byte, n)))
+		req.RemoteAddr = ip + ":1"
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	mk := func(i int) string {
+		h := []byte(strings.Repeat("0", 32))
+		h[30] = "0123456789abcdef"[i/16%16]
+		h[31] = "0123456789abcdef"[i%16]
+		return "/v1/pair/" + string(h) + "/a"
+	}
+	for i := 0; i < perIPPairs; i++ {
+		if c := put("198.51.100.1", mk(i), 10); c != 201 {
+			t.Fatalf("приглашение %d: %d", i, c)
+		}
+	}
+	if c := put("198.51.100.1", mk(perIPPairs), 10); c != 503 {
+		t.Fatalf("квота IP должна сработать: %d", c)
+	}
+	if c := put("198.51.100.2", mk(perIPPairs+1), 10); c != 201 {
+		t.Fatalf("другой IP не страдает: %d", c)
+	}
+	clk.Advance(11 * time.Minute) // всё протухло
+	srv.Sweep()
+	if c := put("198.51.100.1", mk(0), 10); c != 201 {
+		t.Fatalf("после протухания квота освобождается: %d", c)
+	}
+	srv.mu.Lock()
+	n, owners := len(srv.m), len(srv.counts)
+	srv.mu.Unlock()
+	if n != 1 || owners != 1 {
+		t.Fatalf("учёт квот расходится с хранилищем: записей %d, владельцев %d", n, owners)
+	}
+}
+
+func TestFriendBlobLimitAndHeartbeatKeepsQuota(t *testing.T) {
+	c, srv, _ := setup(t)
+	fid := strings.Repeat("ab", 32)
+	if err := c.PutFriend(ctx, fid, "a", make([]byte, MaxFriendBlob+1)); err == nil {
+		t.Fatal("блок статуса больше лимита")
+	}
+	for i := 0; i < 50; i++ { // heartbeat перезаписывает, а не копит
+		if err := c.PutFriend(ctx, fid, "a", []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.mu.Lock()
+	n := len(srv.m)
+	cnt := srv.total[1]
+	srv.mu.Unlock()
+	if n != 1 || cnt != 1 {
+		t.Fatalf("записей %d, счётчик %d", n, cnt)
+	}
+}
+
+func TestClientKeyIPv6Prefix(t *testing.T) {
+	a := clientKey("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:5000")
+	b := clientKey("[2001:db8:1:2:1111:2222:3333:4444]:6000")
+	if a != b {
+		t.Fatalf("один /64 — один клиент: %q %q", a, b)
+	}
+	if clientKey("[2001:db8:1:3::1]:1") == a {
+		t.Fatal("другой /64 — другой клиент")
+	}
+	if clientKey("203.0.113.9:80") != "203.0.113.9" {
+		t.Fatal("IPv4")
+	}
+}
+
+func TestBucketsEvictInsteadOfRefuse(t *testing.T) {
+	srv := NewServer()
+	h := srv.Handler()
+	srv.mu.Lock()
+	for i := 0; i < maxBuckets; i++ {
+		srv.buckets[strings.Repeat("x", 1)+string(rune(i))] = &bucket{tokens: 1, last: time.Now()}
+	}
+	srv.mu.Unlock()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	req.RemoteAddr = "203.0.113.77:1"
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("новый клиент при полной таблице должен обслуживаться: %d", rec.Code)
+	}
+}

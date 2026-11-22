@@ -137,17 +137,16 @@ func (s *appState) deleteFriend(f *friend) {
 // --- статусы ---
 
 func (s *appState) onPeerStatus(id string, st peerStatus) {
-	s.statuses[id] = st
 	f := s.findFriend(id)
 	if f == nil {
-		return
+		return // друга удалили, пока шёл запрос
 	}
+	s.statuses[id] = st
 	s.renderFriends()
 
 	switch s.phase {
 	case phaseIdle:
 		if st.Online && st.State == stCalling && st.Age < ringFresh && !s.handled[st.Call] {
-			s.handled[st.Call] = true
 			s.showIncoming(f, st)
 		}
 	case phaseCalling:
@@ -180,6 +179,7 @@ func (s *appState) onCallProgress(f *friend, st peerStatus) {
 		s.dismissCallDialog()
 		s.pres.SetOwn(f.ID, stIdle, "", nil)
 		s.phase = phaseSession
+		s.callFriend, s.callID = f, id // наш STUN-коллбэк увидит смену id и отпустит сокет
 		s.stopKeep(func() { s.acceptCall(f, id, ep) })
 	}
 }
@@ -236,6 +236,7 @@ func (s *appState) startCall(f *friend) {
 		fyne.Do(func() {
 			if s.phase != phaseCalling || s.callID != id {
 				s.releaseSock() // звонок отменили, пока определялись адреса
+				s.checkIncoming()
 				return
 			}
 			if len(public)+len(lan) == 0 {
@@ -268,7 +269,7 @@ func (s *appState) endAttempt(msg string) {
 	s.phase = phaseIdle
 	s.callFriend = nil
 	s.setStatus(msg)
-	s.stopKeep(nil)
+	s.stopKeep(s.checkIncoming) // сокет освободится не сразу — тогда и проверим входящие
 	s.renderFriends()
 }
 
@@ -411,6 +412,7 @@ func (s *appState) showIncoming(f *friend, st peerStatus) {
 	if err := s.ensureConn(); err != nil || s.engine == nil {
 		return
 	}
+	s.handled[st.Call] = true
 	s.phase = phaseIncoming
 	s.callFriend, s.callID, s.incomingEP = f, st.Call, st.EP
 	s.renderFriends()
@@ -444,6 +446,7 @@ func (s *appState) cancelIncoming(msg string) {
 	s.callFriend = nil
 	s.setStatus(msg)
 	s.renderFriends()
+	s.checkIncoming()
 }
 
 func (s *appState) declineCall() {
@@ -462,13 +465,30 @@ func (s *appState) declineCall() {
 		})
 	}
 	s.renderFriends()
+	s.checkIncoming()
 }
 
 // acceptCall: определяем свои адреса, публикуем их как ответ и сразу
 // запускаем сессию к адресам звонящего.
 func (s *appState) acceptCall(f *friend, id string, callerEP proto.Endpoints) {
+	s.acceptCallTry(f, id, callerEP, 0)
+}
+
+// acceptCallTry: если сокет ещё занят нашим же STUN-запросом (встречный
+// вызов), ждём его освобождения, а не бросаем звонок.
+func (s *appState) acceptCallTry(f *friend, id string, callerEP proto.Endpoints, n int) {
 	if !s.acquireSock() {
-		s.cancelIncoming("Подождите: идёт другое соединение.")
+		if n >= 20 {
+			s.cancelIncoming("Подождите: идёт другое соединение.")
+			return
+		}
+		time.AfterFunc(250*time.Millisecond, func() {
+			fyne.Do(func() {
+				if (s.phase == phaseSession || s.phase == phaseIncoming) && s.callID == id && s.session == nil {
+					s.acceptCallTry(f, id, callerEP, n+1)
+				}
+			})
+		})
 		return
 	}
 	s.phase = phaseSession
@@ -504,4 +524,25 @@ func (s *appState) abortSession(msg string) {
 	s.callFriend = nil
 	s.setStatus(msg)
 	s.renderFriends()
+	s.checkIncoming()
+}
+
+// checkIncoming — «уровневая» проверка входящих: если друг уже звонит, а мы
+// только что освободились (завершили разговор, отменили попытку), показываем
+// звонок, даже если статус друга с тех пор не менялся.
+func (s *appState) checkIncoming() {
+	if s.phase != phaseIdle || s.sockBusy || s.pres == nil {
+		return
+	}
+	for _, f := range s.friends {
+		st, ok := s.pres.Status(f.ID)
+		if !ok || !st.Online || st.State != stCalling || s.handled[st.Call] {
+			continue
+		}
+		if st.Age+time.Since(st.Seen) > ringFresh {
+			continue
+		}
+		s.showIncoming(f, st)
+		return
+	}
 }
