@@ -218,3 +218,37 @@ func TestFriendMigrationAndID(t *testing.T) {
 		t.Fatal("friend id")
 	}
 }
+
+// У пользователя без друзей состояние сервера всё равно должно определиться
+// (раньше в подвале навсегда оставалось «проверяем…»).
+func TestServerStateWithoutFriends(t *testing.T) {
+	old := healthEvery
+	healthEvery = time.Second
+	defer func() { healthEvery = old }()
+	ts := httptest.NewServer(rdv.NewServer().Handler())
+	p := newPresence()
+	got := make(chan bool, 4)
+	p.onServer = func(ok bool) { got <- ok }
+	p.SetClient(rdv.NewClient(ts.URL))
+	go p.Run()
+	defer p.Stop()
+
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Fatal("сервер доступен, а сообщено обратное")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("состояние сервера так и не определилось")
+	}
+
+	ts.Close() // сервер пропал — приложение должно это заметить
+	select {
+	case ok := <-got:
+		if ok {
+			t.Fatal("ожидали «недоступен»")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("падение сервера не замечено")
+	}
+}

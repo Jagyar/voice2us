@@ -25,13 +25,16 @@ const (
 	stDeclined  = "declined"
 	stInCall    = "incall"
 
-	putSlow   = 15 * time.Second // heartbeat в покое
-	putFast   = 4 * time.Second  // во время вызова
-	getSlow   = 3 * time.Second
-	getFast   = 1 * time.Second // пока ждём ответа на свой вызов
-	downRetry = 10 * time.Second
-	ringFresh = 12 * time.Second // входящий вызов старше — считаем мёртвым
+	putSlow     = 15 * time.Second // heartbeat в покое
+	putFast     = 4 * time.Second  // во время вызова
+	getSlow     = 3 * time.Second
+	getFast     = 1 * time.Second // пока ждём ответа на свой вызов
+	downRetry   = 10 * time.Second
+	ringFresh   = 12 * time.Second // входящий вызов старше — считаем мёртвым
 )
+
+// healthEvery — как часто проверять сервер независимо от друзей (в тестах короче).
+var healthEvery = 20 * time.Second
 
 type peerStatus struct {
 	Online bool
@@ -60,17 +63,18 @@ type presenceBlob struct {
 }
 
 type presence struct {
-	mu       sync.Mutex
-	client   *rdv.Client
-	friends  []*friend
-	name     string
-	own      map[string]ownState
-	busy     bool
-	lastPut  map[string]time.Time
-	lastGet  map[string]time.Time
-	last     map[string]peerStatus
-	down     time.Time // до этого момента сервер не трогаем
-	serverOK *bool
+	mu         sync.Mutex
+	client     *rdv.Client
+	friends    []*friend
+	name       string
+	own        map[string]ownState
+	busy       bool
+	lastPut    map[string]time.Time
+	lastGet    map[string]time.Time
+	last       map[string]peerStatus
+	down       time.Time // до этого момента сервер не трогаем
+	serverOK   *bool
+	lastHealth time.Time
 
 	onUpdate func(id string, st peerStatus) // из горутины presence
 	onServer func(ok bool)
@@ -103,6 +107,7 @@ func (p *presence) SetClient(c *rdv.Client) {
 	p.down = time.Time{}
 	p.lastPut = map[string]time.Time{}
 	p.lastGet = map[string]time.Time{}
+	p.lastHealth = time.Time{}
 	p.mu.Unlock()
 	p.poke()
 }
@@ -186,9 +191,30 @@ func (p *presence) tick() {
 	p.mu.Lock()
 	client := p.client
 	friends := append([]*friend(nil), p.friends...)
-	down := time.Now().Before(p.down)
+	now := time.Now()
+	down := now.Before(p.down)
+	every := healthEvery
+	if p.serverOK != nil && !*p.serverOK {
+		every = downRetry
+	}
+	healthDue := now.Sub(p.lastHealth) >= every
+	if healthDue {
+		p.lastHealth = now
+	}
 	p.mu.Unlock()
-	if client == nil || client.Base == "" || down {
+	if client == nil || client.Base == "" {
+		return
+	}
+	// Состояние сервера не должно зависеть от наличия друзей: иначе у нового
+	// пользователя без друзей в подвале вечно «проверяем…».
+	if healthDue {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Health(ctx)
+		cancel()
+		p.serverResult(err == nil)
+		down = time.Now().Before(p.down)
+	}
+	if down {
 		return
 	}
 	for _, f := range friends {
